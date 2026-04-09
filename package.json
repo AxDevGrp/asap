@@ -10,22 +10,23 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.x",
     "next": "14.x",
+    "openai": "^6.34.0",
     "react": "^18.x",
     "react-dom": "^18.x",
-    "@supabase/supabase-js": "^2.x",
     "resend": "^3.x",
     "zod": "^3.x"
   },
   "devDependencies": {
-    "typescript": "^5.x",
     "@types/node": "^20.x",
     "@types/react": "^18.x",
     "@types/react-dom": "^18.x",
-    "tailwindcss": "^3.x",
-    "postcss": "^8.x",
     "autoprefixer": "^10.x",
     "eslint": "^8.x",
-    "eslint-config-next": "14.x"
+    "eslint-config-next": "14.x",
+    "postcss": "^8.x",
+    "tailwindcss": "^3.x",
+    "typescript": "^5.x"
   }
 }
