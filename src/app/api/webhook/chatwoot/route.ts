@@ -1,36 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createHmac, timingSafeEqual } from 'crypto';
 import { ChatwootWebhookPayload } from '@/types/chatwoot';
 import { triageTicket } from '@/lib/gemini';
 import { sendReply, addLabel } from '@/lib/chatwoot';
 import { createTicket, createMessage, getTicketByConvoId, updateTicketByConvoId } from '@/lib/db';
 import { getProductFromInbox, getProductName } from '@/lib/config';
 
-// ── HMAC signature verification ──────────────────────────────────────────────
-function verifySignature(body: string, signature: string | null): boolean {
-  const secret = process.env.CHATWOOT_WEBHOOK_SECRET;
-  if (!secret) {
-    console.warn('[Webhook] CHATWOOT_WEBHOOK_SECRET not set — skipping verification');
-    return true; // Allow through in dev; enforce in prod
-  }
-  if (!signature) return false;
-  const expected = createHmac('sha256', secret).update(body).digest('hex');
-  try {
-    return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch {
-    return false;
-  }
-}
-
 // ── Main handler ─────────────────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
   const rawBody = await request.text();
-  const signature = request.headers.get('x-chatwoot-signature');
-
-  if (!verifySignature(rawBody, signature)) {
-    console.warn('[Webhook] Invalid signature — rejected');
-    return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
-  }
 
   let payload: ChatwootWebhookPayload;
   try {
