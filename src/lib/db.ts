@@ -1,4 +1,74 @@
 import { supabase } from './supabase';
+import { embedText } from './embeddings';
+
+// ── Knowledge Base ─────────────────────────────────────────────────────────────
+
+export interface KBArticleInsert {
+  product: string;
+  title: string;
+  content: string;
+}
+
+export interface KBArticleRow extends KBArticleInsert {
+  id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Insert a new KB article, embedding it automatically.
+ */
+export async function createKBArticle(data: KBArticleInsert): Promise<KBArticleRow | null> {
+  let embedding: number[] | null = null;
+  try {
+    embedding = await embedText(`${data.title}\n${data.content}`);
+  } catch (err) {
+    console.error('[DB] createKBArticle: embedding failed, inserting without embedding:', err);
+  }
+
+  const { data: row, error } = await supabase
+    .from('knowledge_base')
+    .insert({ ...data, embedding })
+    .select('id, product, title, content, created_at, updated_at')
+    .single();
+
+  if (error) {
+    console.error('[DB] createKBArticle error:', error);
+    return null;
+  }
+  return row as KBArticleRow;
+}
+
+/**
+ * List all KB articles for a product (no embeddings returned).
+ */
+export async function listKBArticles(product?: string): Promise<KBArticleRow[]> {
+  let query = supabase
+    .from('knowledge_base')
+    .select('id, product, title, content, created_at, updated_at')
+    .order('created_at', { ascending: false });
+
+  if (product) query = query.eq('product', product);
+
+  const { data, error } = await query;
+  if (error) {
+    console.error('[DB] listKBArticles error:', error);
+    return [];
+  }
+  return (data ?? []) as KBArticleRow[];
+}
+
+/**
+ * Delete a KB article by ID.
+ */
+export async function deleteKBArticle(id: string): Promise<boolean> {
+  const { error } = await supabase.from('knowledge_base').delete().eq('id', id);
+  if (error) {
+    console.error('[DB] deleteKBArticle error:', error);
+    return false;
+  }
+  return true;
+}
 
 export interface TicketInsert {
   chatwoot_inbox_id: number;

@@ -4,6 +4,7 @@ import { triageTicket } from '@/lib/gemini';
 import { sendReply, addLabel } from '@/lib/chatwoot';
 import { createTicket, createMessage, getTicketByConvoId, updateTicketByConvoId } from '@/lib/db';
 import { getProductFromInbox, getProductName } from '@/lib/config';
+import { searchKB, generateRagReply } from '@/lib/rag';
 
 // ── Main handler ─────────────────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
@@ -76,9 +77,28 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // 5. Send auto-reply
-    const replyText = triageResult?.suggested_reply
-      ?? `Hi ${contact?.name ?? 'there'}, thanks for reaching out to ${productName} support! We've received your message and will get back to you shortly.`;
+    // 5. RAG: search KB for relevant articles, then generate grounded reply
+    let replyText: string;
+    try {
+      const kbArticles = await searchKB(messageContent, product);
+      replyText = await generateRagReply(
+        messageContent,
+        kbArticles,
+        triageResult ?? {},
+        productName,
+        contact?.name
+      );
+      if (kbArticles.length > 0) {
+        console.log(`[Webhook] RAG: found ${kbArticles.length} KB articles (top similarity: ${kbArticles[0].similarity.toFixed(2)})`);
+      } else {
+        console.log('[Webhook] RAG: no KB articles found, using triage suggested_reply');
+      }
+    } catch (err) {
+      console.error('[Webhook] RAG reply generation failed:', err);
+      replyText =
+        triageResult?.suggested_reply ??
+        `Hi ${contact?.name ?? 'there'}, thanks for reaching out to ${productName} support! We've received your message and will get back to you shortly.`;
+    }
 
     try {
       await sendReply(conversation.id, replyText);
