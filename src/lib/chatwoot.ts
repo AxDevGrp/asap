@@ -32,6 +32,29 @@ export async function sendReply(conversationId: number, message: string): Promis
 }
 
 /**
+ * Send a private note (internal note) to a Chatwoot conversation.
+ * Used for AI draft replies that need human review before sending.
+ */
+export async function sendPrivateNote(conversationId: number, message: string): Promise<void> {
+  const res = await fetch(
+    `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}/conversations/${conversationId}/messages`,
+    {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({
+        content: message,
+        message_type: 'outgoing',
+        private: true,
+      }),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Chatwoot sendPrivateNote failed ${res.status}: ${err}`);
+  }
+}
+
+/**
  * Add a label to a Chatwoot conversation (e.g. 'urgent', 'bug', 'billing')
  */
 export async function addLabel(conversationId: number, label: string): Promise<void> {

@@ -52,7 +52,7 @@ export async function searchKB(
 export async function generateRagReply(
   message: string,
   articles: KBArticle[],
-  triage: Partial<TriageResult> & { suggested_reply?: string },
+  triage: Partial<TriageResult>,
   productName: string,
   contactName?: string | null
 ): Promise<string> {
@@ -117,4 +117,77 @@ Write a support reply:`;
   content = content.replace(/<thought>[\s\S]*?<\/thought>\s*/g, '').trim();
 
   return content || (triage.suggested_reply ?? `Hi ${contactName ?? 'there'}, thanks for reaching out!`);
+}
+
+/**
+ * Generate a RAG-grounded draft reply for a follow-up message with full
+ * conversation context. Includes prior messages so the LLM can maintain
+ * continuity and avoid repeating information.
+ */
+export async function generateFollowUpReply(
+  newMessage: string,
+  conversationHistory: string,
+  articles: KBArticle[],
+  productName: string,
+  contactName?: string | null
+): Promise<string> {
+  const apiKey = process.env.GOOGLE_API_KEY;
+  if (!apiKey) {
+    console.warn('[RAG] GOOGLE_API_KEY not set — returning generic follow-up');
+    return `Hi ${contactName ?? 'there'}, thanks for the follow-up! We're looking into this and will get back to you shortly.`;
+  }
+
+  const context = articles.length > 0
+    ? articles
+        .map((a, i) => `[${i + 1}] ${a.title}\n${a.content}`)
+        .join('\n\n')
+    : '(No specific KB articles found for this follow-up)';
+
+  const systemPrompt = `You are a helpful support agent for ${productName}. 
+You are continuing an ongoing conversation with a customer.
+Use the conversation history and knowledge base articles to provide a coherent, helpful follow-up reply.
+Do NOT repeat what was already said. Address the new question or concern directly.
+Keep the reply concise (2-4 sentences). Use the customer's name if provided. Do NOT make up information.`;
+
+  const userPrompt = `Customer name: ${contactName ?? 'unknown'}
+
+Conversation so far:
+${conversationHistory}
+
+Customer's new message: ${newMessage}
+
+Knowledge Base Articles:
+${context}
+
+Write a follow-up support reply:`;
+
+  const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
+  const response = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gemma-4-26b-a4b-it',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    console.error(`[RAG] Gemini follow-up error ${response.status}: ${err}`);
+    return `Hi ${contactName ?? 'there'}, thanks for the follow-up! We're looking into this and will get back to you.`;
+  }
+
+  const data = await response.json();
+  let content: string = data.choices?.[0]?.message?.content ?? '';
+
+  // Strip thinking blocks if present
+  content = content.replace(/<thought>[\s\S]*?<\/thought>\s*/g, '').trim();
+
+  return content || `Hi ${contactName ?? 'there'}, thanks for the follow-up! We're looking into this.`;
 }

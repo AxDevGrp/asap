@@ -44,4 +44,5 @@ export interface TriageResult {
   urgency: 'low' | 'medium' | 'high' | 'critical';
   confidence: number;
   summary: string;
+  suggested_reply: string;
 }

@@ -59,6 +59,56 @@ export async function listKBArticles(product?: string): Promise<KBArticleRow[]> 
 }
 
 /**
+ * Update a KB article by ID. Re-embeds on title/content change.
+ */
+export async function updateKBArticle(
+  id: string,
+  updates: Partial<Pick<KBArticleInsert, 'title' | 'content' | 'product'>>
+): Promise<KBArticleRow | null> {
+  const updateData: Record<string, unknown> = { ...updates };
+
+  // Re-embed if title or content changed
+  if (updates.title || updates.content) {
+    // Need both title and content for embedding — fetch current if only one changed
+    if (!updates.title || !updates.content) {
+      const { data: current } = await supabase
+        .from('knowledge_base')
+        .select('title, content')
+        .eq('id', id)
+        .single();
+      if (current) {
+        const title = updates.title ?? current.title;
+        const content = updates.content ?? current.content;
+        try {
+          updateData.embedding = await embedText(`${title}\n${content}`);
+        } catch (err) {
+          console.error('[DB] updateKBArticle: re-embedding failed:', err);
+        }
+      }
+    } else {
+      try {
+        updateData.embedding = await embedText(`${updates.title}\n${updates.content}`);
+      } catch (err) {
+        console.error('[DB] updateKBArticle: re-embedding failed:', err);
+      }
+    }
+  }
+
+  const { data: row, error } = await supabase
+    .from('knowledge_base')
+    .update(updateData)
+    .eq('id', id)
+    .select('id, product, title, content, created_at, updated_at')
+    .single();
+
+  if (error) {
+    console.error('[DB] updateKBArticle error:', error);
+    return null;
+  }
+  return row as KBArticleRow;
+}
+
+/**
  * Delete a KB article by ID.
  */
 export async function deleteKBArticle(id: string): Promise<boolean> {
@@ -69,6 +119,8 @@ export async function deleteKBArticle(id: string): Promise<boolean> {
   }
   return true;
 }
+
+// ── Tickets ─────────────────────────────────────────────────────────────────────
 
 export interface TicketInsert {
   chatwoot_inbox_id: number;
@@ -139,6 +191,23 @@ export async function getTicketByConvoId(chatwootConvoId: number) {
 
   if (error) return null;
   return data;
+}
+
+/**
+ * Get all messages for a ticket, ordered chronologically.
+ */
+export async function getMessagesByTicketId(ticketId: string) {
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('ticket_id', ticketId)
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.error('[DB] getMessagesByTicketId error:', error);
+    return [];
+  }
+  return data ?? [];
 }
 
 /**
