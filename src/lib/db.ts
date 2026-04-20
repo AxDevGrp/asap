@@ -134,7 +134,22 @@ export interface TicketInsert {
   triage_confidence?: number;
   auto_reply_sent?: boolean;
   auto_reply_text?: string;
+  auto_resolved?: boolean;
+  resolve_reason?: string;
   status?: 'open' | 'resolved' | 'pending';
+}
+
+export interface ResolveAuditInsert {
+  ticket_id?: string | null;
+  chatwoot_convo_id: number;
+  product: string;
+  auto_send: boolean;
+  reason: string;
+  triage_confidence?: number | null;
+  triage_type?: string | null;
+  triage_urgency?: string | null;
+  kb_hits?: number;
+  top_kb_similarity?: number | null;
 }
 
 export interface MessageInsert {
@@ -220,5 +235,19 @@ export async function createMessage(data: MessageInsert) {
 
   if (error) {
     console.error('[DB] createMessage error:', error);
+  }
+}
+
+/**
+ * Insert an audit record for an auto-resolve decision.
+ * Every decision (both auto-send and draft-only) is logged for analysis.
+ */
+export async function createResolveAudit(data: ResolveAuditInsert): Promise<void> {
+  const { error } = await supabase
+    .from('resolve_audit')
+    .insert(data);
+
+  if (error) {
+    console.error('[DB] createResolveAudit error:', error);
   }
 }
