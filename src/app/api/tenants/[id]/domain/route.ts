@@ -1,148 +1,242 @@
 // POST  /api/tenants/[id]/domain — register tenant domain with Resend
-// GET   /api/tenants/[id]/domain — get current Resend domain status
-// PATCH /api/tenants/[id]/domain — trigger domain verification check
+// PATCH /api/tenants/[id]/domain — verify domain status with Resend
 
 import { NextRequest, NextResponse } from 'next/server';
-import { getTenantById, updateTenant } from '@/lib/tenant';
-import {
-  registerResendDomain,
-  getResendDomainStatus,
-  verifyResendDomain,
-} from '@/lib/resend';
+import { cookies } from 'next/headers';
+import { createServerClient } from '@supabase/ssr';
+import { createSupabaseAdminClient } from '@/lib/supabase-server';
 
 type Params = { params: Promise<{ id: string }> };
 
 /**
- * GET — fetch Resend domain status for this tenant.
- * Returns domain verification records and current status.
- */
-export async function GET(_request: NextRequest, { params }: Params) {
-  const { id } = await params;
-
-  const tenant = await getTenantById(id);
-  if (!tenant) {
-    return NextResponse.json({ error: 'Tenant not found' }, { status: 404 });
-  }
-
-  if (!tenant.resend_domain_id) {
-    return NextResponse.json({
-      status: 'not_registered',
-      message: 'No Resend domain registered yet. POST to this endpoint to register.',
-      domain: tenant.domain,
-    });
-  }
-
-  const domainStatus = await getResendDomainStatus(tenant.resend_domain_id);
-  if (!domainStatus) {
-    return NextResponse.json(
-      { error: 'Failed to fetch domain status from Resend' },
-      { status: 502 }
-    );
-  }
-
-  return NextResponse.json({
-    tenant_id: tenant.id,
-    domain: tenant.domain,
-    resend_domain_id: tenant.resend_domain_id,
-    status: domainStatus.status,
-    records: domainStatus.records,
-    created_at: domainStatus.created_at,
-  });
-}
-
-/**
  * POST — register the tenant's domain with Resend.
- * Saves the resend_domain_id back to the tenants table.
- * Optional body: { region: "us-east-1" | "eu-west-1" }
+ * Stores the returned domain id as resend_domain_id.
  */
 export async function POST(request: NextRequest, { params }: Params) {
-  const { id } = await params;
-
-  const tenant = await getTenantById(id);
-  if (!tenant) {
-    return NextResponse.json({ error: 'Tenant not found' }, { status: 404 });
-  }
-
-  if (tenant.resend_domain_id) {
-    return NextResponse.json(
-      {
-        error: 'Domain already registered',
-        resend_domain_id: tenant.resend_domain_id,
-        hint: 'Use PATCH to trigger verification, or GET to check status.',
-      },
-      { status: 409 }
-    );
-  }
-
-  let region: 'us-east-1' | 'eu-west-1' = 'us-east-1';
   try {
-    const body = await request.json().catch(() => ({}));
-    if (body?.region === 'eu-west-1') region = 'eu-west-1';
-  } catch { /* use default */ }
+    const { id } = await params;
 
-  const result = await registerResendDomain(tenant.domain, region);
-  if (!result) {
-    return NextResponse.json(
-      { error: 'Failed to register domain with Resend. Check RESEND_API_KEY.' },
-      { status: 502 }
+    // Authenticate user
+    const cookieStore = await cookies();
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          getAll() {
+            return cookieStore.getAll();
+          },
+          setAll(cookiesToSet) {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          },
+        },
+      }
     );
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const admin = createSupabaseAdminClient();
+
+    // Validate tenant exists
+    const { data: tenant, error: tenantError } = await admin
+      .from('tenants')
+      .select('id, domain, resend_domain_id')
+      .eq('id', id)
+      .single();
+
+    if (tenantError || !tenant) {
+      return NextResponse.json({ error: 'Tenant not found' }, { status: 404 });
+    }
+
+    // Verify user is owner or admin of this tenant
+    const { data: membership, error: membershipError } = await admin
+      .from('tenant_memberships')
+      .select('role')
+      .eq('tenant_id', id)
+      .eq('user_id', user.id)
+      .in('role', ['owner', 'admin'])
+      .single();
+
+    if (membershipError || !membership) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    if (tenant.resend_domain_id) {
+      return NextResponse.json(
+        { error: 'Domain already registered' },
+        { status: 409 }
+      );
+    }
+
+    // Call Resend API to register domain
+    const res = await fetch('https://api.resend.com/domains', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: tenant.domain }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error('[POST /api/tenants/:id/domain] Resend error:', text);
+      return NextResponse.json(
+        { error: 'Failed to register domain with Resend' },
+        { status: 502 }
+      );
+    }
+
+    const data = (await res.json()) as {
+      id: string;
+      name: string;
+      status: string;
+    };
+
+    // Persist resend_domain_id
+    const { error: updateError } = await admin
+      .from('tenants')
+      .update({ resend_domain_id: data.id })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('[POST /api/tenants/:id/domain] DB update error:', updateError);
+      return NextResponse.json(
+        { error: 'Failed to save domain ID' },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({
+      domainId: data.id,
+      name: data.name,
+      status: data.status,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal server error';
+    console.error('[POST /api/tenants/:id/domain] unexpected error:', message);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  // Persist the Resend domain ID to the tenant record
-  await updateTenant(id, { resend_domain_id: result.id });
-
-  return NextResponse.json({
-    tenant_id: tenant.id,
-    domain: tenant.domain,
-    resend_domain_id: result.id,
-    dns_records: result.records,
-    next_steps: [
-      '1. Add the DNS records above to your domain registrar.',
-      '2. Wait for DNS propagation (can take up to 48h).',
-      '3. PATCH this endpoint to trigger Resend verification check.',
-      '4. Check GET this endpoint to confirm status is "verified".',
-    ],
-  }, { status: 201 });
 }
 
 /**
- * PATCH — trigger a Resend domain verification check.
- * Call this after DNS records have been added.
+ * PATCH — verify the domain with Resend.
+ * Updates the tenant record with the latest status.
  */
-export async function PATCH(_request: NextRequest, { params }: Params) {
-  const { id } = await params;
+export async function PATCH(request: NextRequest, { params }: Params) {
+  try {
+    const { id } = await params;
 
-  const tenant = await getTenantById(id);
-  if (!tenant) {
-    return NextResponse.json({ error: 'Tenant not found' }, { status: 404 });
-  }
-
-  if (!tenant.resend_domain_id) {
-    return NextResponse.json(
-      { error: 'No Resend domain registered yet. POST first.' },
-      { status: 400 }
+    // Authenticate user
+    const cookieStore = await cookies();
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          getAll() {
+            return cookieStore.getAll();
+          },
+          setAll(cookiesToSet) {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options)
+            );
+          },
+        },
+      }
     );
-  }
 
-  const success = await verifyResendDomain(tenant.resend_domain_id);
-  if (!success) {
-    return NextResponse.json(
-      { error: 'Verification check failed. DNS records may not have propagated yet.' },
-      { status: 502 }
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const admin = createSupabaseAdminClient();
+
+    // Validate tenant exists
+    const { data: tenant, error: tenantError } = await admin
+      .from('tenants')
+      .select('id, domain, resend_domain_id, settings')
+      .eq('id', id)
+      .single();
+
+    if (tenantError || !tenant) {
+      return NextResponse.json({ error: 'Tenant not found' }, { status: 404 });
+    }
+
+    // Verify user is owner or admin of this tenant
+    const { data: membership, error: membershipError } = await admin
+      .from('tenant_memberships')
+      .select('role')
+      .eq('tenant_id', id)
+      .eq('user_id', user.id)
+      .in('role', ['owner', 'admin'])
+      .single();
+
+    if (membershipError || !membership) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    if (!tenant.resend_domain_id) {
+      return NextResponse.json(
+        { error: 'Domain not registered yet' },
+        { status: 400 }
+      );
+    }
+
+    // Call Resend API to check domain status
+    const res = await fetch(
+      `https://api.resend.com/domains/${tenant.resend_domain_id}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      }
     );
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error('[PATCH /api/tenants/:id/domain] Resend error:', text);
+      return NextResponse.json(
+        { error: 'Failed to fetch domain status from Resend' },
+        { status: 502 }
+      );
+    }
+
+    const data = (await res.json()) as {
+      id: string;
+      status: string;
+    };
+
+    // Update tenant record with latest status
+    const currentSettings = (tenant.settings as Record<string, unknown> | null) || {};
+    const { error: updateError } = await admin
+      .from('tenants')
+      .update({
+        settings: { ...currentSettings, domainStatus: data.status },
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('[PATCH /api/tenants/:id/domain] DB update error:', updateError);
+      return NextResponse.json(
+        { error: 'Failed to update tenant status' },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({
+      status: data.status as 'verified' | 'pending',
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal server error';
+    console.error('[PATCH /api/tenants/:id/domain] unexpected error:', message);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  // Fetch updated status
-  const domainStatus = await getResendDomainStatus(tenant.resend_domain_id);
-
-  return NextResponse.json({
-    tenant_id: tenant.id,
-    domain: tenant.domain,
-    resend_domain_id: tenant.resend_domain_id,
-    status: domainStatus?.status ?? 'unknown',
-    message:
-      domainStatus?.status === 'verified'
-        ? 'Domain verified! Outbound email is ready.'
-        : 'Verification triggered. DNS propagation may still be in progress.',
-  });
 }

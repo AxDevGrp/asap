@@ -1,167 +1,174 @@
-// POST /api/webhook/resend — Resend email delivery & inbound status webhook
-//
-// This handler manages:
-// 1. INBOUND: Receiving new emails for tenants (the core of our engine).
-// 2. OUTBOUND: Tracking delivery status (sent, delivered, bounced, etc.).
-//
-// Reference: https://resend.com/docs/dashboard/webhooks/event-types
-
 import { NextRequest, NextResponse } from 'next/server';
-import * as crypto from 'crypto';
-import { 
-  updateOutboundMessageByResendId, 
-  findOrCreateConversation, 
-  createInboundMessage 
-} from '@/lib/db';
+import { createHmac, timingSafeEqual } from 'crypto';
+import { createSupabaseAdminClient } from '@/lib/supabase-server';
 import { getTenantByDomain } from '@/lib/tenant';
-import { checkWebhookLimit } from '@/lib/rate-limit';
 
-// ── Signature verification ───────────────────────────────────────────────────
+// ── Svix webhook signature verification ─────────────────────────────────────────
+// Resend sends Svix-signed webhooks. We verify manually with Node crypto so
+// we don't need to add the svix package (keeps dependencies unchanged).
 
-function verifyResendSignature(
+function verifySvixSignature(
   payload: string,
-  svixId: string | null,
-  svixTimestamp: string | null,
-  svixSignature: string | null,
-  secret: string
+  secret: string,
+  id: string,
+  timestamp: string,
+  signatureHeader: string
 ): boolean {
-  if (!svixId || !svixTimestamp || !svixSignature) return false;
-
-  const signedContent = `${svixId}.${svixTimestamp}.${payload}`;
-  const secretBytes = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
-  const expectedSig = crypto
-    .createHmac('sha256', secretBytes)
+  const signedContent = `${id}.${timestamp}.${payload}`;
+  const expectedSig = createHmac('sha256', secret)
     .update(signedContent)
     .digest('base64');
 
-  const signatures = svixSignature.split(' ');
-  for (const sig of signatures) {
-    const [version, value] = sig.split(',');
-    if (version === 'v1' && value === expectedSig) return true;
-  }
+  const signatures = signatureHeader
+    .split(' ')
+    .filter((s) => s.startsWith('v1='))
+    .map((s) => s.slice(3));
 
+  if (signatures.length === 0) return false;
+
+  const expectedBuf = Buffer.from(expectedSig, 'base64');
+  for (const sig of signatures) {
+    try {
+      const sigBuf = Buffer.from(sig, 'base64');
+      if (
+        sigBuf.length === expectedBuf.length &&
+        timingSafeEqual(sigBuf, expectedBuf)
+      ) {
+        return true;
+      }
+    } catch {
+      // ignore invalid base64
+    }
+  }
   return false;
 }
 
-// ── Status mapping ───────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────────
 
-type OutboundStatus = 'pending' | 'sent' | 'delivered' | 'bounced' | 'complained' | 'failed';
-
-function resendEventToStatus(eventType: string): OutboundStatus | null {
-  const map: Record<string, OutboundStatus> = {
-    'email.sent': 'sent',
-    'email.delivered': 'delivered',
-    'email.delivery_delayed': 'pending',
-    'email.bounced': 'bounced',
-    'email.complained': 'complained',
-  };
-  return map[eventType] ?? null;
+function extractEmail(from: string): string {
+  const match = from.match(/<([^>]+)>/);
+  return match ? match[1].trim() : from.trim();
 }
 
-// ── Webhook handler ──────────────────────────────────────────────────────────
+function extractDomain(email: string): string | null {
+  const parts = email.split('@');
+  return parts.length === 2 ? parts[1].toLowerCase() : null;
+}
+
+function normalizeTo(dataTo: unknown): string {
+  if (typeof dataTo === 'string') return dataTo;
+  if (Array.isArray(dataTo) && dataTo.length > 0) {
+    return typeof dataTo[0] === 'string' ? dataTo[0] : '';
+  }
+  return '';
+}
+
+// ── POST /api/webhook/resend ───────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
-  if (!checkWebhookLimit(ip)) {
-    console.warn(`[ResendWebhook] Rate limit exceeded for IP: ${ip}`);
-    return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-  }
-
-  const rawBody = await request.text();
-  const svixId = request.headers.get('svix-id');
-  const svixTimestamp = request.headers.get('svix-timestamp');
-  const svixSignature = request.headers.get('svix-signature');
-
-  const webhookSecret = process.env.RESEND_WEBHOOK_SECRET;
-  if (webhookSecret) {
-    const valid = verifyResendSignature(
-      rawBody,
-      svixId,
-      svixTimestamp,
-      svixSignature,
-      webhookSecret
-    );
-    if (!valid) {
-      console.warn('[ResendWebhook] Invalid signature — rejecting');
-      return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
-    }
-  } else {
-    console.warn('[ResendWebhook] No RESEND_WEBHOOK_SECRET set — skipping signature check (dev mode)');
-  }
-
-  let event: any;
   try {
-    event = JSON.parse(rawBody);
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
-  }
+    const rawBody = await request.text();
+    const secret = process.env.RESEND_WEBHOOK_SECRET;
 
-  const { type: eventType, data } = event;
+    // 1. Verify Svix webhook signature (skipped in dev if secret is unset)
+    if (secret) {
+      const id = request.headers.get('svix-id') ?? '';
+      const timestamp = request.headers.get('svix-timestamp') ?? '';
+      const signature = request.headers.get('svix-signature') ?? '';
 
-  // 1. Handle INBOUND Emails (The "Core Engine" logic)
-  if (eventType === 'inbound') {
-    // Resend inbound payload: data.to is an array of recipients
-    const toAddresses = data?.to || [];
-    const targetDomain = toAddresses[0]?.split('@')[1];
+      if (!id || !timestamp || !signature) {
+        return NextResponse.json(
+          { error: 'Missing webhook headers' },
+          { status: 401 }
+        );
+      }
 
-    if (!targetDomain) {
-      console.warn('[ResendWebhook] Inbound email missing target domain');
-      return NextResponse.json({ error: 'Missing target domain' }, { status: 400 });
+      if (!verifySvixSignature(rawBody, secret, id, timestamp, signature)) {
+        return NextResponse.json(
+          { error: 'Invalid webhook signature' },
+          { status: 401 }
+        );
+      }
     }
 
-    const tenant = await getTenantByDomain(targetDomain);
-    if (!tenant) {
-      console.warn(`[ResendWebhook] No tenant found for domain: ${targetDomain}`);
-      return NextResponse.json({ error: 'Tenant not found' }, { status: 404 });
+    // 2. Parse payload
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      return NextResponse.json(
+        { error: 'Invalid JSON payload' },
+        { status: 400 }
+      );
     }
 
-    // Create or find the conversation for this customer
-    const conversation = await findOrCreateConversation({
-      tenant_id: tenant.id,
-      customer_email: data.from,
-      customer_name: data.from_name || null,
-      subject: data.subject || '(No Subject)',
-    });
+    const event = payload as {
+      type?: string;
+      data?: Record<string, unknown>;
+    };
 
-    if (!conversation) {
-      console.error('[ResendWebhook] Failed to create/find conversation');
-      return NextResponse.json({ error: 'Failed to create conversation' }, { status: 500 });
+    const data = event.data ?? {};
+
+    // Extract email fields (defensively)
+    const fromRaw = typeof data.from === 'string' ? data.from : '';
+    const toRaw = normalizeTo(data.to);
+    const subject =
+      typeof data.subject === 'string' ? data.subject : '(no subject)';
+    const text = typeof data.text === 'string' ? data.text : '';
+
+    const contactEmail = extractEmail(fromRaw);
+    const toEmail = extractEmail(toRaw);
+    const domain = extractDomain(toEmail);
+
+    // 3. Resolve tenant by recipient domain
+    let tenantId: string | null = null;
+    if (domain) {
+      const tenant = await getTenantByDomain(domain);
+      if (tenant) {
+        tenantId = tenant.id;
+      }
     }
 
-    // Log the actual message
-    await createInboundMessage({
-      conversation_id: conversation.id,
-      tenant_id: tenant.id,
-      from_email: data.from,
-      subject: data.subject || '(No Subject)',
-      body_text: data.text || '',
-      body_html: data.html || null,
-    });
+    // 4. Create ticket
+    // NOTE: Legacy schema requires chatwoot_inbox_id, chatwoot_convo_id, product.
+    // These are nullable after migration 010 is applied. Until then, we provide defaults.
+    const admin = createSupabaseAdminClient();
 
-    console.log(`[ResendWebhook] INBOUND processed: ${tenant.name} | ${data.from} -> ${targetDomain}`);
-    return NextResponse.json({ received: true });
+    const { data: ticket, error } = await admin
+      .from('tickets')
+      .insert({
+        tenant_id: tenantId,
+        contact_name: null,
+        contact_email: contactEmail,
+        subject,
+        body: text,
+        triage_type: null,
+        triage_urgency: null,
+        triage_summary: null,
+        status: 'open',
+        auto_resolved: false,
+        auto_reply_sent: false,
+        // Legacy fields — required until migration 010 is applied
+        chatwoot_inbox_id: 0,
+        chatwoot_convo_id: Date.now(),
+        product: 'unknown',
+      })
+      .select()
+      .single();
+
+    if (error || !ticket) {
+      console.error('[Resend Webhook] create ticket error:', error);
+      return NextResponse.json(
+        { error: error?.message ?? 'Failed to create ticket' },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ticket }, { status: 200 });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Internal server error';
+    console.error('[Resend Webhook] unexpected error:', message);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  // 2. Handle OUTBOUND Status Updates (Legacy tracking)
-  const resendMessageId = data?.email_id;
-  if (!resendMessageId) {
-    return NextResponse.json({ received: true });
-  }
-
-  const newStatus = resendEventToStatus(eventType);
-  if (!newStatus) {
-    console.log(`[ResendWebhook] Unhandled event type: ${eventType}`);
-    return NextResponse.json({ received: true });
-  }
-
-  await updateOutboundMessageByResendId(resendMessageId, {
-    status: newStatus,
-    error_message:
-      newStatus === 'bounced' || newStatus === 'complained'
-        ? `${eventType} at ${new Date().toISOString()}`
-        : null,
-  });
-
-  console.log(`[ResendWebhook] OUTBOUND status update: ${resendMessageId} → ${newStatus}`);
-  return NextResponse.json({ received: true });
 }
