@@ -130,8 +130,6 @@ export async function POST(request: NextRequest) {
     }
 
     // 4. Create ticket
-    // NOTE: Legacy schema requires chatwoot_inbox_id, chatwoot_convo_id, product.
-    // These are nullable after migration 010 is applied. Until then, we provide defaults.
     const admin = createSupabaseAdminClient();
 
     const { data: ticket, error } = await admin
@@ -148,10 +146,6 @@ export async function POST(request: NextRequest) {
         status: 'open',
         auto_resolved: false,
         auto_reply_sent: false,
-        // Legacy fields — required until migration 010 is applied
-        chatwoot_inbox_id: 0,
-        chatwoot_convo_id: Date.now(),
-        product: 'unknown',
       })
       .select()
       .single();
