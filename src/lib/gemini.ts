@@ -13,24 +13,36 @@ const TriageSchema = z.object({
   suggested_reply: z.string().describe('A friendly, helpful first response to send to the user'),
 });
 
+export interface TenantContext {
+  name: string;
+  domain?: string;
+  tone?: string; // e.g. 'professional', 'friendly', 'technical'
+  brandContext?: string; // extra context to inject into prompts
+}
+
 export async function triageTicket(
   message: string,
   subject: string,
-  productName: string
+  productName: string,
+  tenantCtx?: TenantContext
 ): Promise<TriageResult & { suggested_reply: string }> {
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_API_KEY not set');
 
-  const systemPrompt = `You are a support ticket triage specialist for ${productName}. Analyze the message and classify it. Also write a short, friendly auto-reply to acknowledge receipt and set expectations. Return JSON only — no markdown, no prose, just the JSON object.`;
+  const tenantName = tenantCtx?.name ?? productName;
+  const toneHint = tenantCtx?.tone ? ` Tone: ${tenantCtx.tone}.` : '';
+  const brandHint = tenantCtx?.brandContext ? ` Context: ${tenantCtx.brandContext}.` : '';
+
+  const systemPrompt = `You are a support ticket triage specialist for ${tenantName}.${toneHint}${brandHint} Analyze the message and classify it. Also write a short, friendly auto-reply to acknowledge receipt and set expectations. Return JSON only — no markdown, no prose, just the JSON object.`;
 
   const userPrompt = `Subject: ${subject}
 
 Message: ${message}
 
 Return JSON with exactly these fields:
-- product: the product/service mentioned or \"${productName}\"
-- type: one of \"bug\", \"feature_request\", \"question\", \"billing\", \"account\", \"other\"
-- urgency: one of \"low\", \"medium\", \"high\", \"critical\"
+- product: the product/service mentioned or "${tenantName}"
+- type: one of "bug", "feature_request", "question", "billing", "account", "other"
+- urgency: one of "low", "medium", "high", "critical"
 - confidence: number 0.0 to 1.0
 - summary: 1-2 sentence summary of the issue
 - suggested_reply: friendly 2-3 sentence acknowledgement reply to send to the user`;

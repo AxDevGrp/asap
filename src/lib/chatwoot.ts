@@ -1,6 +1,6 @@
 const CHATWOOT_URL = process.env.CHATWOOT_API_URL!;
 const CHATWOOT_KEY = process.env.CHATWOOT_API_KEY!;
-const ACCOUNT_ID = 1; // GlobalCorp Chatwoot account
+const DEFAULT_ACCOUNT_ID = 1; // fallback for legacy / internal k3nz0 account
 
 function headers() {
   return {
@@ -9,12 +9,20 @@ function headers() {
   };
 }
 
+function accountId(tenantAccountId?: number | null): number {
+  return tenantAccountId ?? DEFAULT_ACCOUNT_ID;
+}
+
 /**
  * Send an outgoing message to a Chatwoot conversation
  */
-export async function sendReply(conversationId: number, message: string): Promise<void> {
+export async function sendReply(
+  conversationId: number,
+  message: string,
+  tenantAccountId?: number | null
+): Promise<void> {
   const res = await fetch(
-    `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}/conversations/${conversationId}/messages`,
+    `${CHATWOOT_URL}/api/v1/accounts/${accountId(tenantAccountId)}/conversations/${conversationId}/messages`,
     {
       method: 'POST',
       headers: headers(),
@@ -35,9 +43,13 @@ export async function sendReply(conversationId: number, message: string): Promis
  * Send a private note (internal note) to a Chatwoot conversation.
  * Used for AI draft replies that need human review before sending.
  */
-export async function sendPrivateNote(conversationId: number, message: string): Promise<void> {
+export async function sendPrivateNote(
+  conversationId: number,
+  message: string,
+  tenantAccountId?: number | null
+): Promise<void> {
   const res = await fetch(
-    `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}/conversations/${conversationId}/messages`,
+    `${CHATWOOT_URL}/api/v1/accounts/${accountId(tenantAccountId)}/conversations/${conversationId}/messages`,
     {
       method: 'POST',
       headers: headers(),
@@ -57,9 +69,13 @@ export async function sendPrivateNote(conversationId: number, message: string): 
 /**
  * Add a label to a Chatwoot conversation (e.g. 'urgent', 'bug', 'billing')
  */
-export async function addLabel(conversationId: number, label: string): Promise<void> {
+export async function addLabel(
+  conversationId: number,
+  label: string,
+  tenantAccountId?: number | null
+): Promise<void> {
   const res = await fetch(
-    `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}/conversations/${conversationId}/labels`,
+    `${CHATWOOT_URL}/api/v1/accounts/${accountId(tenantAccountId)}/conversations/${conversationId}/labels`,
     {
       method: 'POST',
       headers: headers(),
@@ -75,9 +91,13 @@ export async function addLabel(conversationId: number, label: string): Promise<v
 /**
  * Update conversation status
  */
-export async function updateStatus(conversationId: number, status: 'open' | 'resolved' | 'pending'): Promise<void> {
+export async function updateStatus(
+  conversationId: number,
+  status: 'open' | 'resolved' | 'pending',
+  tenantAccountId?: number | null
+): Promise<void> {
   const res = await fetch(
-    `${CHATWOOT_URL}/api/v1/accounts/${ACCOUNT_ID}/conversations/${conversationId}`,
+    `${CHATWOOT_URL}/api/v1/accounts/${accountId(tenantAccountId)}/conversations/${conversationId}`,
     {
       method: 'PATCH',
       headers: headers(),

@@ -11,6 +11,7 @@ import {
   getMessagesByTicketId,
   createResolveAudit,
 } from '@/lib/db';
+import { getTenantByInboxId } from '@/lib/tenant';
 import { getProductFromInbox, getProductName } from '@/lib/config';
 import { searchKB, generateRagReply, generateFollowUpReply, KBArticle } from '@/lib/rag';
 import { shouldAutoResolve, DEFAULT_POLICIES } from '@/lib/auto-resolve';
@@ -54,6 +55,25 @@ export async function POST(request: NextRequest) {
 
   const { event, inbox_id, conversation, messages, contact } = payload;
 
+  // ── Tenant resolution: DB-first, fallback to hardcoded map ─────────────────
+  const tenant = await getTenantByInboxId(inbox_id);
+  const tenantId: string | null = tenant?.id ?? null;
+  const tenantAccountId: number | null = tenant?.chatwoot_account_id ?? null;
+
+  // product slug for backward compat (existing ticket records use product field)
+  const product = tenant?.slug ?? getProductFromInbox(inbox_id);
+  const productName = tenant?.name ?? getProductName(product);
+
+  // Build tenant context for AI prompts
+  const tenantCtx = tenant
+    ? {
+        name: tenant.name,
+        domain: tenant.domain,
+        tone: (tenant.settings?.tone as string | undefined),
+        brandContext: (tenant.settings?.brandContext as string | undefined),
+      }
+    : undefined;
+
   // ── conversation_created: new support ticket ───────────────────────────────
   if (event === 'conversation_created') {
     const firstMessage = messages?.[0];
@@ -61,26 +81,25 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: 'ignored', reason: 'No message content' });
     }
 
-    const product = getProductFromInbox(inbox_id);
-    const productName = getProductName(product);
     const messageContent = firstMessage.content;
     const subject = contact?.name ? `Message from ${contact.name}` : 'New Support Message';
 
-    console.log(`[Webhook] New conversation ${conversation.id} — ${productName} (inbox ${inbox_id})`);
+    console.log(`[Webhook] New conversation ${conversation.id} — ${productName} (inbox ${inbox_id}, tenant ${tenantId ?? 'fallback'})`);
 
-    // 1. Triage with Gemma 4 26B
+    // 1. Triage with Gemma 4 26B (tenant-aware prompts)
     let triageResult: (TriageResult & { suggested_reply: string }) | undefined;
     try {
-      triageResult = await triageTicket(messageContent, subject, productName);
+      triageResult = await triageTicket(messageContent, subject, productName, tenantCtx);
     } catch (err) {
       console.error('[Webhook] Triage failed:', err);
     }
 
-    // 2. Save ticket to Supabase
+    // 2. Save ticket to Supabase (with tenant_id)
     const ticket = await createTicket({
       chatwoot_inbox_id: inbox_id,
       chatwoot_convo_id: conversation.id,
       product,
+      tenant_id: tenantId,
       contact_name: contact?.name ?? null,
       contact_email: contact?.email ?? null,
       triage_type: triageResult?.type,
@@ -90,7 +109,7 @@ export async function POST(request: NextRequest) {
       status: 'open',
     });
 
-    // 3. Save incoming message
+    // 3. Save incoming message (with tenant_id)
     if (ticket) {
       await createMessage({
         ticket_id: ticket.id,
@@ -98,14 +117,15 @@ export async function POST(request: NextRequest) {
         direction: 'incoming',
         content: messageContent,
         sender_name: contact?.name ?? null,
+        tenant_id: tenantId,
       });
     }
 
-    // 4. Add urgency + type labels in Chatwoot
+    // 4. Add urgency + type labels in Chatwoot (tenant-specific account)
     if (triageResult?.urgency) {
       try {
-        await addLabel(conversation.id, triageResult.urgency);
-        if (triageResult.type) await addLabel(conversation.id, triageResult.type);
+        await addLabel(conversation.id, triageResult.urgency, tenantAccountId);
+        if (triageResult.type) await addLabel(conversation.id, triageResult.type, tenantAccountId);
       } catch (err) {
         console.error('[Webhook] addLabel failed:', err);
       }
@@ -115,7 +135,7 @@ export async function POST(request: NextRequest) {
     let replyText: string;
     let kbArticles: KBArticle[] = [];
     try {
-      kbArticles = await searchKB(messageContent, product);
+      kbArticles = await searchKB(messageContent, product, 3, 0.5, tenantId ?? undefined);
       replyText = await generateRagReply(
         messageContent,
         kbArticles,
@@ -148,13 +168,13 @@ export async function POST(request: NextRequest) {
     try {
       if (autoSend) {
         // ── AUTO-SEND: reply goes directly to the customer ─────────────────────
-        await sendReply(conversation.id, replyText);
-        await addLabel(conversation.id, 'auto-resolved');
+        await sendReply(conversation.id, replyText, tenantAccountId);
+        await addLabel(conversation.id, 'auto-resolved', tenantAccountId);
 
         // Auto-resolve the conversation in Chatwoot if policy allows
         const policy = DEFAULT_POLICIES[product];
         if (policy?.autoResolveConversation) {
-          await updateStatus(conversation.id, 'resolved');
+          await updateStatus(conversation.id, 'resolved', tenantAccountId);
         }
 
         if (ticket) {
@@ -175,13 +195,14 @@ export async function POST(request: NextRequest) {
           `Confidence: ${triageResult?.confidence?.toFixed(2) ?? 'N/A'} | Type: ${triageResult?.type ?? 'N/A'} | Urgency: ${triageResult?.urgency ?? 'N/A'}`,
           `KB articles matched: ${kbHitCount} | Top similarity: ${topKbSimilarity?.toFixed(2) ?? 'N/A'}`,
         ].join('\n');
-        await sendPrivateNote(conversation.id, auditNote);
+        await sendPrivateNote(conversation.id, auditNote, tenantAccountId);
 
         // Audit log
         await createResolveAudit({
           ticket_id: ticket?.id ?? null,
           chatwoot_convo_id: conversation.id,
           product,
+          tenant_id: tenantId,
           auto_send: true,
           reason: resolveReason,
           triage_confidence: triageResult?.confidence ?? null,
@@ -204,8 +225,8 @@ export async function POST(request: NextRequest) {
           `KB articles matched: ${kbHitCount} | Top similarity: ${topKbSimilarity?.toFixed(2) ?? 'N/A'}`,
         ].join('\n');
 
-        await sendPrivateNote(conversation.id, draftNote);
-        await addLabel(conversation.id, 'ai-draft');
+        await sendPrivateNote(conversation.id, draftNote, tenantAccountId);
+        await addLabel(conversation.id, 'ai-draft', tenantAccountId);
 
         if (ticket) {
           await updateTicketByConvoId(conversation.id, {
@@ -221,6 +242,7 @@ export async function POST(request: NextRequest) {
           ticket_id: ticket?.id ?? null,
           chatwoot_convo_id: conversation.id,
           product,
+          tenant_id: tenantId,
           auto_send: false,
           reason: resolveReason,
           triage_confidence: triageResult?.confidence ?? null,
@@ -240,6 +262,7 @@ export async function POST(request: NextRequest) {
       status: 'success',
       conversation_id: conversation.id,
       product,
+      tenant_id: tenantId,
       triage: triageResult ?? null,
       auto_sent: autoSend,
       resolve_reason: resolveReason,
@@ -259,13 +282,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: 'ignored', reason: 'No ticket found for conversation' });
     }
 
-    const product = existingTicket.product;
-    const productName = getProductName(product);
+    const ticketProduct = existingTicket.product;
+    const ticketProductName = tenant?.name ?? getProductName(ticketProduct);
+    const ticketTenantAccountId = tenant?.chatwoot_account_id ?? null;
 
     // Reopen ticket if it was resolved
     if (existingTicket.status === 'resolved') {
       await updateTicketByConvoId(conversation.id, { status: 'open' });
-      try { await updateStatus(conversation.id, 'open'); } catch { /* ignore */ }
+      try { await updateStatus(conversation.id, 'open', ticketTenantAccountId); } catch { /* ignore */ }
     }
 
     // Save follow-up message
@@ -275,6 +299,7 @@ export async function POST(request: NextRequest) {
       direction: 'incoming',
       content: msg.content,
       sender_name: msg.sender?.name ?? null,
+      tenant_id: existingTicket.tenant_id ?? tenantId,
     });
 
     console.log(`[Webhook] Follow-up message logged for conversation ${conversation.id}`);
@@ -289,12 +314,18 @@ export async function POST(request: NextRequest) {
         )
         .join('\n');
 
-      const kbArticles = await searchKB(msg.content, product);
+      const kbArticles = await searchKB(
+        msg.content,
+        ticketProduct,
+        3,
+        0.5,
+        existingTicket.tenant_id ?? tenantId ?? undefined
+      );
       const followUpReply = await generateFollowUpReply(
         msg.content,
         conversationContext,
         kbArticles,
-        productName,
+        ticketProductName,
         existingTicket.contact_name,
       );
 
@@ -308,8 +339,8 @@ export async function POST(request: NextRequest) {
         `Context: ${allMessages.length} messages in conversation | KB hits: ${kbArticles.length} | Top similarity: ${topKbSimilarity?.toFixed(2) ?? 'N/A'}`,
       ].join('\n');
 
-      await sendPrivateNote(conversation.id, draftNote);
-      await addLabel(conversation.id, 'ai-draft');
+      await sendPrivateNote(conversation.id, draftNote, ticketTenantAccountId);
+      await addLabel(conversation.id, 'ai-draft', ticketTenantAccountId);
 
       // Update ticket with new draft
       await updateTicketByConvoId(conversation.id, {

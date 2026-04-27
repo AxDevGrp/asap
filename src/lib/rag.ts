@@ -19,7 +19,8 @@ export async function searchKB(
   query: string,
   product: string,
   topK = 3,
-  minSimilarity = 0.5
+  minSimilarity = 0.5,
+  tenantId?: string
 ): Promise<KBArticle[]> {
   let embedding: number[];
   try {
@@ -29,12 +30,16 @@ export async function searchKB(
     return [];
   }
 
-  const { data, error } = await supabase.rpc('match_knowledge_base', {
+  // If tenantId provided, use tenant-scoped RPC; otherwise fall back to product filter
+  const rpcParams: Record<string, unknown> = {
     query_embedding: embedding,
     product_filter: product,
     match_count: topK,
     min_similarity: minSimilarity,
-  });
+  };
+  if (tenantId) rpcParams.tenant_id_filter = tenantId;
+
+  const { data, error } = await supabase.rpc('match_knowledge_base', rpcParams);
 
   if (error) {
     console.error('[RAG] match_knowledge_base error:', error);

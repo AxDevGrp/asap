@@ -16,7 +16,7 @@ const TriageSchema = z.object({
   summary: z.string().describe('A brief summary of the issue'),
 });
 
-export async function triageTicket(message: string, subject: string): Promise<TriageResult> {
+export async function triageTicket(message: string, subject: string): Promise<Omit<TriageResult, 'suggested_reply'>> {
   const response = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
