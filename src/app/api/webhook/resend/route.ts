@@ -1,7 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createHmac, timingSafeEqual } from 'crypto';
-import { createSupabaseAdminClient } from '@/lib/supabase-server';
 import { getTenantByDomain } from '@/lib/tenant';
+import {
+  findOrCreateConversation,
+  createInboundMessage,
+  getOpenTicketByConversationId,
+  createTicket,
+  updateTicket,
+  createMessage,
+  hasInboundMessage,
+} from '@/lib/db';
+import { enqueueJob, kickJobRunner, getJobByDedupeKey } from '@/lib/jobs';
+import { JOB_TYPE_INBOUND_EMAIL_PROCESS } from '@/lib/job-handlers';
+import { getReceivedEmail } from '@/lib/resend';
+import { checkWebhookLimit } from '@/lib/rate-limit';
 
 // ── Svix webhook signature verification ─────────────────────────────────────────
 // Resend sends Svix-signed webhooks. We verify manually with Node crypto so
@@ -91,7 +103,16 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // 2. Parse payload
+    // 2. Rate limit by client IP
+    const ip =
+      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+      request.headers.get('x-real-ip') ??
+      'unknown';
+    if (!checkWebhookLimit(ip)) {
+      return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
+    }
+
+    // 3. Parse payload
     let payload: unknown;
     try {
       payload = JSON.parse(rawBody);
@@ -107,58 +128,192 @@ export async function POST(request: NextRequest) {
       data?: Record<string, unknown>;
     };
 
+    // Only handle inbound received email; ignore everything else with 200.
+    if (event.type !== 'email.received') {
+      return NextResponse.json(
+        { status: 'ignored', reason: `unhandled event: ${event.type ?? 'none'}` },
+        { status: 200 }
+      );
+    }
+
     const data = event.data ?? {};
 
-    // Extract email fields (defensively)
+    // Extract metadata (the webhook carries no body)
     const fromRaw = typeof data.from === 'string' ? data.from : '';
     const toRaw = normalizeTo(data.to);
     const subject =
       typeof data.subject === 'string' ? data.subject : '(no subject)';
-    const text = typeof data.text === 'string' ? data.text : '';
+    const emailId = typeof data.email_id === 'string' ? data.email_id : '';
+    const messageId = typeof data.message_id === 'string' ? data.message_id : '';
 
     const contactEmail = extractEmail(fromRaw);
     const toEmail = extractEmail(toRaw);
     const domain = extractDomain(toEmail);
 
-    // 3. Resolve tenant by recipient domain
-    let tenantId: string | null = null;
-    if (domain) {
-      const tenant = await getTenantByDomain(domain);
-      if (tenant) {
-        tenantId = tenant.id;
+    if (!contactEmail) {
+      return NextResponse.json(
+        { status: 'ignored', reason: 'no sender address' },
+        { status: 200 }
+      );
+    }
+
+    // 4. Dedupe by the job's dedupe key. A job existing means this email was
+    //    already ingested and queued — ignore the retry. We key on the job, not
+    //    the inbound message, so a failed enqueue (500) still lets Resend retry.
+    const dedupeKey = messageId || emailId ? `inbound_email:${messageId || emailId}` : '';
+
+    if (dedupeKey) {
+      const existingJob = await getJobByDedupeKey(dedupeKey);
+      if (existingJob) {
+        return NextResponse.json(
+          { status: 'ignored', reason: 'duplicate message', job_id: existingJob.id },
+          { status: 200 }
+        );
       }
     }
 
-    // 4. Create ticket
-    const admin = createSupabaseAdminClient();
+    // Already ingested by an earlier attempt that failed before enqueueing?
+    // Skip re-inserting the inbound message / ticket message to avoid dup rows.
+    const alreadyIngested = messageId ? await hasInboundMessage(messageId) : false;
 
-    const { data: ticket, error } = await admin
-      .from('tickets')
-      .insert({
-        tenant_id: tenantId,
-        contact_name: null,
-        contact_email: contactEmail,
-        subject,
-        body: text,
-        triage_type: null,
-        triage_urgency: null,
-        triage_summary: null,
-        status: 'open',
-        auto_resolved: false,
-        auto_reply_sent: false,
-      })
-      .select()
-      .single();
-
-    if (error || !ticket) {
-      console.error('[Resend Webhook] create ticket error:', error);
+    // 5. Resolve tenant by recipient domain
+    const tenant = domain ? await getTenantByDomain(domain) : null;
+    if (!tenant) {
+      console.warn(
+        `[Resend Webhook] No tenant for recipient domain "${domain ?? 'unknown'}" (from ${contactEmail}) — dropping`
+      );
       return NextResponse.json(
-        { error: error?.message ?? 'Failed to create ticket' },
+        { status: 'ignored', reason: `no tenant for domain ${domain ?? 'unknown'}` },
+        { status: 200 }
+      );
+    }
+
+    // 6. Fetch the email body (500 so Resend retries if it fails)
+    const received = emailId ? await getReceivedEmail(emailId) : null;
+    if (!received) {
+      return NextResponse.json(
+        { error: 'Failed to fetch received email body' },
+        { status: 500 }
+      );
+    }
+    const text = received.text;
+
+    // 7. Thread into one conversation per contact/tenant, log inbound message
+    const conversation = await findOrCreateConversation({
+      tenant_id: tenant.id,
+      customer_email: contactEmail,
+      customer_name: null,
+      subject,
+    });
+
+    if (!conversation) {
+      return NextResponse.json(
+        { error: 'Failed to create conversation' },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ ticket }, { status: 200 });
+    if (!alreadyIngested) {
+      await createInboundMessage({
+        conversation_id: conversation.id,
+        tenant_id: tenant.id,
+        from_email: contactEmail,
+        subject,
+        body_text: text,
+        body_html: received.html,
+        message_id: messageId || null,
+      });
+    }
+
+    // 8. Reuse the conversation's open ticket as a follow-up, else create one
+    const existingTicket = await getOpenTicketByConversationId(conversation.id);
+    const isFollowUp = Boolean(existingTicket);
+
+    let ticketId: string;
+    if (existingTicket) {
+      ticketId = existingTicket.id;
+      if (existingTicket.status === 'resolved') {
+        await updateTicket(ticketId, { status: 'open' });
+      }
+      if (!alreadyIngested) {
+        await createMessage({
+          ticket_id: ticketId,
+          direction: 'incoming',
+          content: text,
+          sender_name: existingTicket.contact_name ?? null,
+          tenant_id: tenant.id,
+        });
+      }
+    } else {
+      const ticket = await createTicket({
+        tenant_id: tenant.id,
+        conversation_id: conversation.id,
+        contact_name: null,
+        contact_email: contactEmail,
+        subject,
+        body: text,
+        status: 'open',
+        auto_resolved: false,
+        auto_reply_sent: false,
+      });
+      if (!ticket) {
+        return NextResponse.json(
+          { error: 'Failed to create ticket' },
+          { status: 500 }
+        );
+      }
+      ticketId = ticket.id;
+      if (!alreadyIngested) {
+        await createMessage({
+          ticket_id: ticketId,
+          direction: 'incoming',
+          content: text,
+          sender_name: null,
+          tenant_id: tenant.id,
+        });
+      }
+    }
+
+    // 9. Enqueue the AI pipeline as a durable background job and respond
+    //    immediately. The runner drains the queue (and a scheduler is the
+    //    backstop), so the webhook never waits on AI work or times out.
+    let jobId: string;
+    try {
+      const job = await enqueueJob({
+        type: JOB_TYPE_INBOUND_EMAIL_PROCESS,
+        tenantId: tenant.id,
+        payload: {
+          tenantId: tenant.id,
+          ticketId,
+          conversationId: conversation.id,
+          contactEmail,
+          contactName: null,
+          subject,
+          body: text,
+          isFollowUp,
+        },
+        dedupeKey: dedupeKey || null,
+      });
+      jobId = job.id;
+    } catch (enqueueErr) {
+      const message =
+        enqueueErr instanceof Error ? enqueueErr.message : 'Failed to enqueue job';
+      console.error('[Resend Webhook] enqueue failed:', message);
+      return NextResponse.json({ error: message }, { status: 500 });
+    }
+
+    kickJobRunner();
+
+    return NextResponse.json(
+      {
+        status: 'queued',
+        ticket_id: ticketId,
+        conversation_id: conversation.id,
+        is_follow_up: isFollowUp,
+        job_id: jobId,
+      },
+      { status: 202 }
+    );
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Internal server error';

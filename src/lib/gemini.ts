@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { TriageResult } from '@/types/chatwoot';
+import { TriageResult } from '@/types/triage';
 
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
 const GEMINI_MODEL = 'gemma-4-26b-a4b-it';

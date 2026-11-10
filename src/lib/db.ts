@@ -1,11 +1,11 @@
 import { supabase } from './supabase';
-import { embedText } from './embeddings';
+import { embedDocument } from './embeddings';
 import { createClient } from '@supabase/supabase-js';
 
 // Service-role client for server-side writes that bypass RLS
 function getServiceSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
   return createClient(url, key);
 }
 
@@ -30,7 +30,7 @@ export interface KBArticleRow extends KBArticleInsert {
 export async function createKBArticle(data: KBArticleInsert): Promise<KBArticleRow | null> {
   let embedding: number[] | null = null;
   try {
-    embedding = await embedText(`${data.title}\n${data.content}`);
+    embedding = await embedDocument(data.title, data.content);
   } catch (err) {
     console.error('[DB] createKBArticle: embedding failed, inserting without embedding:', err);
   }
@@ -49,21 +49,14 @@ export async function createKBArticle(data: KBArticleInsert): Promise<KBArticleR
 }
 
 /**
- * List all KB articles for a product/tenant (no embeddings returned).
+ * List a tenant's KB articles (no embeddings returned).
  */
-export async function listKBArticles(product?: string, tenantId?: string): Promise<KBArticleRow[]> {
-  let query = supabase
+export async function listKBArticles(tenantId: string): Promise<KBArticleRow[]> {
+  const { data, error } = await supabase
     .from('knowledge_base')
     .select('id, product, tenant_id, title, content, created_at, updated_at')
+    .eq('tenant_id', tenantId)
     .order('created_at', { ascending: false });
-
-  if (tenantId) {
-    query = query.eq('tenant_id', tenantId);
-  } else if (product) {
-    query = query.eq('product', product);
-  }
-
-  const { data, error } = await query;
   if (error) {
     console.error('[DB] listKBArticles error:', error);
     return [];
@@ -76,7 +69,8 @@ export async function listKBArticles(product?: string, tenantId?: string): Promi
  */
 export async function updateKBArticle(
   id: string,
-  updates: Partial<Pick<KBArticleInsert, 'title' | 'content' | 'product'>>
+  updates: Partial<Pick<KBArticleInsert, 'title' | 'content' | 'product'>>,
+  tenantId: string
 ): Promise<KBArticleRow | null> {
   const updateData: Record<string, unknown> = { ...updates };
 
@@ -88,19 +82,20 @@ export async function updateKBArticle(
         .from('knowledge_base')
         .select('title, content')
         .eq('id', id)
+        .eq('tenant_id', tenantId)
         .single();
       if (current) {
         const title = updates.title ?? current.title;
         const content = updates.content ?? current.content;
         try {
-          updateData.embedding = await embedText(`${title}\n${content}`);
+          updateData.embedding = await embedDocument(title, content);
         } catch (err) {
           console.error('[DB] updateKBArticle: re-embedding failed:', err);
         }
       }
     } else {
       try {
-        updateData.embedding = await embedText(`${updates.title}\n${updates.content}`);
+        updateData.embedding = await embedDocument(updates.title, updates.content);
       } catch (err) {
         console.error('[DB] updateKBArticle: re-embedding failed:', err);
       }
@@ -111,6 +106,7 @@ export async function updateKBArticle(
     .from('knowledge_base')
     .update(updateData)
     .eq('id', id)
+    .eq('tenant_id', tenantId)
     .select('id, product, tenant_id, title, content, created_at, updated_at')
     .single();
 
@@ -124,13 +120,18 @@ export async function updateKBArticle(
 /**
  * Delete a KB article by ID.
  */
-export async function deleteKBArticle(id: string): Promise<boolean> {
-  const { error } = await supabase.from('knowledge_base').delete().eq('id', id);
+export async function deleteKBArticle(id: string, tenantId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('knowledge_base')
+    .delete()
+    .eq('id', id)
+    .eq('tenant_id', tenantId)
+    .select('id');
   if (error) {
     console.error('[DB] deleteKBArticle error:', error);
     return false;
   }
-  return true;
+  return (data ?? []).length > 0;
 }
 
 // ── Conversations (Custom Engine) ─────────────────────────────────────────────────────────────
@@ -192,6 +193,7 @@ export async function createInboundMessage(data: {
   subject: string;
   body_text: string;
   body_html?: string | null;
+  message_id?: string | null;
 }) {
   const db = getServiceSupabase();
   const { error } = await db
@@ -203,6 +205,7 @@ export async function createInboundMessage(data: {
       subject: data.subject,
       body_text: data.body_text,
       body_html: data.body_html ?? null,
+      message_id: data.message_id ?? null,
     });
 
   if (error) {
@@ -210,29 +213,44 @@ export async function createInboundMessage(data: {
   }
 }
 
-// ── Tickets (Chatwoot-Legacy) ───────────────────────────────────────────────────────────────────
+/**
+ * Check whether an inbound message with this provider message ID was already
+ * processed (used to deduplicate webhook retries).
+ */
+export async function hasInboundMessage(messageId: string): Promise<boolean> {
+  const db = getServiceSupabase();
+  const { data } = await db
+    .from('inbound_messages')
+    .select('id')
+    .eq('message_id', messageId)
+    .limit(1)
+    .maybeSingle();
+  return Boolean(data);
+}
+
+// ── Tickets ─────────────────────────────────────────────────────────────────────
 
 export interface TicketInsert {
-  chatwoot_inbox_id: number;
-  chatwoot_convo_id: number;
-  product: string;
+  product?: string | null;
   tenant_id?: string | null;
+  conversation_id?: string | null;
   contact_name?: string | null;
   contact_email?: string | null;
-  triage_type?: string;
-  triage_urgency?: 'low' | 'medium' | 'high' | 'critical';
-  triage_summary?: string;
-  triage_confidence?: number;
+  subject?: string | null;
+  body?: string | null;
+  triage_type?: string | null;
+  triage_urgency?: 'low' | 'medium' | 'high' | 'critical' | null;
+  triage_summary?: string | null;
+  triage_confidence?: number | null;
   auto_reply_sent?: boolean;
-  auto_reply_text?: string;
+  auto_reply_text?: string | null;
   auto_resolved?: boolean;
-  resolve_reason?: string;
+  resolve_reason?: string | null;
   status?: 'open' | 'resolved' | 'pending';
 }
 
 export interface ResolveAuditInsert {
   ticket_id?: string | null;
-  chatwoot_convo_id: number;
   product: string;
   tenant_id?: string | null;
   auto_send: boolean;
@@ -242,11 +260,11 @@ export interface ResolveAuditInsert {
   triage_urgency?: string | null;
   kb_hits?: number;
   top_kb_similarity?: number | null;
+  policy_version?: number | null;
 }
 
 export interface MessageInsert {
   ticket_id: string;
-  chatwoot_message_id: number;
   direction: 'incoming' | 'outgoing';
   content: string;
   sender_name?: string | null;
@@ -271,16 +289,13 @@ export async function createTicket(data: TicketInsert) {
 }
 
 /**
- * Update a ticket by its Chatwoot conversation ID.
+ * Update a ticket by its ID.
  */
-export async function updateTicketByConvoId(
-  chatwootConvoId: number,
-  updates: Partial<TicketInsert>
-) {
+export async function updateTicket(id: string, updates: Partial<TicketInsert>) {
   const { error } = await supabase
     .from('tickets')
-    .update(updates)
-    .eq('chatwoot_convo_id', chatwootConvoId);
+    .update({ ...updates, updated_at: new Date().toISOString() })
+    .eq('id', id);
 
   if (error) {
     console.error('[DB] updateTicket error:', error);
@@ -288,14 +303,17 @@ export async function updateTicketByConvoId(
 }
 
 /**
- * Get a ticket by Chatwoot conversation ID.
+ * Get the most recent open ticket for a conversation (used to thread follow-ups).
  */
-export async function getTicketByConvoId(chatwootConvoId: number) {
+export async function getOpenTicketByConversationId(conversationId: string) {
   const { data, error } = await supabase
     .from('tickets')
     .select('*')
-    .eq('chatwoot_convo_id', chatwootConvoId)
-    .single();
+    .eq('conversation_id', conversationId)
+    .neq('status', 'resolved')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
   if (error) return null;
   return data;
@@ -350,7 +368,6 @@ export async function createResolveAudit(data: ResolveAuditInsert): Promise<void
 export interface OutboundMessageInsert {
   tenant_id: string;
   ticket_id?: string | null;
-  chatwoot_convo_id?: number | null;
   resend_message_id?: string | null;
   to_email: string;
   from_email: string;
@@ -359,6 +376,7 @@ export interface OutboundMessageInsert {
   body_html?: string | null;
   status?: 'pending' | 'sent' | 'delivered' | 'bounced' | 'complained' | 'failed';
   error_message?: string | null;
+  idempotency_key?: string | null;
 }
 
 export interface OutboundMessageRow extends OutboundMessageInsert {
@@ -384,6 +402,30 @@ export async function createOutboundMessage(
     return null;
   }
   return row as OutboundMessageRow;
+}
+
+/**
+ * Reserve an outbound message (insert). Distinguishes a unique-key conflict
+ * (code 23505, e.g. idempotency_key already reserved) from real errors:
+ * conflict -> { row: null, conflict: true }; other errors throw so callers can
+ * retry instead of silently treating a failure as "already sent".
+ */
+export async function reserveOutboundMessage(
+  data: OutboundMessageInsert
+): Promise<{ row: OutboundMessageRow | null; conflict: boolean }> {
+  const { data: row, error } = await supabase
+    .from('outbound_messages')
+    .insert(data)
+    .select('*')
+    .single();
+
+  if (error) {
+    if (error.code === '23505') {
+      return { row: null, conflict: true };
+    }
+    throw new Error(`reserveOutboundMessage failed: ${error.message}`);
+  }
+  return { row: row as OutboundMessageRow, conflict: false };
 }
 
 /**
@@ -441,4 +483,40 @@ export async function getOutboundMessagesByTenantId(
     return [];
   }
   return (data ?? []) as OutboundMessageRow[];
+}
+
+/**
+ * Get an outbound message by its idempotency key (used to dedupe sends).
+ */
+export async function getOutboundMessageByIdempotencyKey(
+  key: string
+): Promise<OutboundMessageRow | null> {
+  const { data, error } = await supabase
+    .from('outbound_messages')
+    .select('*')
+    .eq('idempotency_key', key)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[DB] getOutboundMessageByIdempotencyKey error:', error);
+    return null;
+  }
+  return (data as OutboundMessageRow) ?? null;
+}
+
+/**
+ * Update an outbound message by its ID.
+ */
+export async function updateOutboundMessage(
+  id: string,
+  updates: Partial<OutboundMessageInsert>
+): Promise<void> {
+  const { error } = await supabase
+    .from('outbound_messages')
+    .update({ ...updates, updated_at: new Date().toISOString() })
+    .eq('id', id);
+
+  if (error) {
+    console.error('[DB] updateOutboundMessage error:', error);
+  }
 }

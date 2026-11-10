@@ -1,12 +1,11 @@
 // Tenant resolution — DB-driven lookup with in-process caching
-// This replaces the hardcoded INBOX_PRODUCT_MAP in config.ts
 
 import { createClient } from '@supabase/supabase-js';
 
 // Use service role for server-side tenant lookups (bypasses RLS)
 function getServiceSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
   return createClient(url, key);
 }
 
@@ -15,49 +14,20 @@ export interface Tenant {
   name: string;
   slug: string;
   domain: string;
-  chatwoot_account_id: number;
-  chatwoot_inbox_id: number | null;
   resend_domain_id: string | null;
   settings: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
 
-// Simple in-process cache — keyed by inbox_id (TTL: 5 minutes)
-const inboxCache = new Map<number, { tenant: Tenant; expiresAt: number }>();
+// Simple in-process cache — keyed by slug/domain/id (TTL: 5 minutes)
 const slugCache = new Map<string, { tenant: Tenant; expiresAt: number }>();
 const domainCache = new Map<string, { tenant: Tenant; expiresAt: number }>();
 const idCache = new Map<string, { tenant: Tenant; expiresAt: number }>();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
- * Resolve a tenant from a Chatwoot inbox_id.
- * Falls back to the hardcoded slug-based mapping if DB lookup fails.
- */
-export async function getTenantByInboxId(inboxId: number): Promise<Tenant | null> {
-  // Check cache
-  const cached = inboxCache.get(inboxId);
-  if (cached && cached.expiresAt > Date.now()) return cached.tenant;
-
-  const supabase = getServiceSupabase();
-  const { data, error } = await supabase
-    .from('tenants')
-    .select('*')
-    .eq('chatwoot_inbox_id', inboxId)
-    .single();
-
-  if (error || !data) {
-    console.warn(`[Tenant] getTenantByInboxId(${inboxId}) failed:`, error?.message ?? 'not found');
-    return null;
-  }
-
-  const tenant = data as Tenant;
-  inboxCache.set(inboxId, { tenant, expiresAt: Date.now() + CACHE_TTL_MS });
-  return tenant;
-}
-
-/**
- * Resolve a tenant from its slug (e.g. 'strk', 'cashpile', 'dailypost').
+ * Resolve a tenant from its slug (e.g. 'goasap').
  */
 export async function getTenantBySlug(slug: string): Promise<Tenant | null> {
   const cached = slugCache.get(slug);
@@ -153,8 +123,6 @@ export async function createTenant(input: {
   name: string;
   slug: string;
   domain: string;
-  chatwoot_account_id?: number;
-  chatwoot_inbox_id?: number;
   resend_domain_id?: string;
   settings?: Record<string, unknown>;
 }): Promise<Tenant | null> {
@@ -195,9 +163,7 @@ export async function updateTenant(
   // Bust caches for this tenant
   idCache.delete(id);
   if (data) {
-    const t = data as Tenant;
-    slugCache.delete(t.slug);
-    if (t.chatwoot_inbox_id) inboxCache.delete(t.chatwoot_inbox_id);
+    slugCache.delete((data as Tenant).slug);
   }
 
   return data as Tenant;
@@ -207,7 +173,7 @@ export async function updateTenant(
  * Invalidate all tenant caches (useful after writes).
  */
 export function invalidateTenantCache() {
-  inboxCache.clear();
   slugCache.clear();
+  domainCache.clear();
   idCache.clear();
 }

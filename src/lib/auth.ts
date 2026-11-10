@@ -70,3 +70,40 @@ export function unauthorizedResponse() {
 export function forbiddenResponse(message = 'Forbidden') {
   return NextResponse.json({ error: message }, { status: 403 });
 }
+
+export type TenantRole = 'owner' | 'admin' | 'agent';
+
+/**
+ * Require a signed-in user who is a member of `tenantId` (optionally with one
+ * of `roles`). Returns the member context, or a ready-to-return error response.
+ *
+ *   const member = await requireTenantMember(tenantId, ['owner', 'admin']);
+ *   if ('error' in member) return member.error;
+ */
+export async function requireTenantMember(
+  tenantId: string,
+  roles?: TenantRole[]
+): Promise<{ userId: string; email: string; role: TenantRole } | { error: NextResponse }> {
+  const supabase = await createSupabaseServerClient();
+  const { data: { user }, error: authError } = await supabase.auth.getUser();
+  if (authError || !user) return { error: unauthorizedResponse() };
+
+  const { data: membership, error } = await supabase
+    .from('tenant_memberships')
+    .select('role')
+    .eq('user_id', user.id)
+    .eq('tenant_id', tenantId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[Auth] membership lookup failed:', error.message);
+    return { error: NextResponse.json({ error: 'Membership lookup failed' }, { status: 500 }) };
+  }
+  if (!membership) return { error: forbiddenResponse('You are not a member of this workspace') };
+
+  const role = membership.role as TenantRole;
+  if (roles && !roles.includes(role)) {
+    return { error: forbiddenResponse(`Requires role: ${roles.join(' or ')}`) };
+  }
+  return { userId: user.id, email: user.email ?? '', role };
+}

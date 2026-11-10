@@ -185,3 +185,62 @@ export async function verifyResendDomain(
     return false;
   }
 }
+
+// ── Inbound email retrieval ──────────────────────────────────────────────────
+//
+// Resend's `email.received` webhook carries metadata only (no body). The body
+// is fetched from the receiving API. The SDK v3 lacks receiving.get, so we use
+// plain fetch against the REST API.
+
+export interface ReceivedEmail {
+  text: string;
+  html: string | null;
+}
+
+/** Crude HTML-to-text fallback when the received email has no text part. */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Fetch a received (inbound) email's body by its Resend email ID.
+ * Returns null on any failure so the webhook can retry (HTTP 500).
+ */
+export async function getReceivedEmail(emailId: string): Promise<ReceivedEmail | null> {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) {
+    console.error('[Resend] getReceivedEmail: missing RESEND_API_KEY');
+    return null;
+  }
+
+  try {
+    const res = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+
+    if (!res.ok) {
+      console.error(
+        `[Resend] getReceivedEmail failed ${res.status}:`,
+        await res.text()
+      );
+      return null;
+    }
+
+    const data = (await res.json()) as { text?: string | null; html?: string | null };
+    const text = data.text?.trim() ? data.text : data.html ? stripHtml(data.html) : '';
+    return { text, html: data.html ?? null };
+  } catch (err) {
+    console.error('[Resend] getReceivedEmail exception:', err);
+    return null;
+  }
+}

@@ -7,16 +7,39 @@ interface TenantSettings {
   name: string;
   slug: string;
   domain: string;
-  chatwoot_account_id: number | null;
-  chatwoot_inbox_id: number | null;
   resend_domain_id: string | null;
   settings: {
     brand_color?: string;
     ai_tone?: 'professional' | 'friendly' | 'concise' | 'empathetic';
-    auto_resolve_threshold?: number; // 0-100
     [key: string]: unknown;
   };
 }
+
+interface TenantPolicy {
+  autoSendEnabled: boolean;
+  confidenceThreshold: number;
+  allowedTypes: string[];
+  allowedUrgencies: string[];
+  minKbSimilarity: number;
+  minKbHits: number;
+  resolveOnAutoSend: boolean;
+  version: number;
+}
+
+const TICKET_TYPE_OPTIONS = [
+  { value: 'question', label: 'Question' },
+  { value: 'billing', label: 'Billing' },
+  { value: 'feature_request', label: 'Feature request' },
+  { value: 'bug', label: 'Bug' },
+  { value: 'other', label: 'Other' },
+];
+
+const URGENCY_OPTIONS = [
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'critical', label: 'Critical' },
+];
 
 const AI_TONE_OPTIONS = [
   { value: 'professional', label: 'Professional', desc: 'Formal, precise, business-like' },
@@ -37,10 +60,13 @@ export default function SettingsPage() {
   const [domain, setDomain] = useState('');
   const [brandColor, setBrandColor] = useState('#111827');
   const [aiTone, setAiTone] = useState<string>('professional');
-  const [autoResolveThreshold, setAutoResolveThreshold] = useState(80);
-  const [chatwootAccountId, setChatwootAccountId] = useState('');
-  const [chatwootInboxId, setChatwootInboxId] = useState('');
   const [resendDomainId, setResendDomainId] = useState('');
+
+  // Auto-resolve policy (loaded/saved separately via /api/tenants/[id]/policy)
+  const [policy, setPolicy] = useState<TenantPolicy | null>(null);
+  const [policySaving, setPolicySaving] = useState(false);
+  const [policySuccess, setPolicySuccess] = useState(false);
+  const [policyError, setPolicyError] = useState<string | null>(null);
 
   const fetchTenant = useCallback(async () => {
     setLoading(true);
@@ -59,10 +85,12 @@ export default function SettingsPage() {
       setDomain(data.domain);
       setBrandColor(data.settings?.brand_color ?? '#111827');
       setAiTone(data.settings?.ai_tone ?? 'professional');
-      setAutoResolveThreshold(data.settings?.auto_resolve_threshold ?? 80);
-      setChatwootAccountId(String(data.chatwoot_account_id ?? ''));
-      setChatwootInboxId(String(data.chatwoot_inbox_id ?? ''));
       setResendDomainId(data.resend_domain_id ?? '');
+
+      const policyRes = await fetch(`/api/tenants/${tenantId}/policy`);
+      if (policyRes.ok) {
+        setPolicy(await policyRes.json());
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load settings');
     } finally {
@@ -73,6 +101,41 @@ export default function SettingsPage() {
   useEffect(() => {
     fetchTenant();
   }, [fetchTenant]);
+
+  async function handleSavePolicy() {
+    if (!tenant || !policy) return;
+
+    setPolicySaving(true);
+    setPolicyError(null);
+    setPolicySuccess(false);
+
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/policy`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          autoSendEnabled: policy.autoSendEnabled,
+          confidenceThreshold: policy.confidenceThreshold,
+          allowedTypes: policy.allowedTypes,
+          allowedUrgencies: policy.allowedUrgencies,
+          minKbSimilarity: policy.minKbSimilarity,
+          minKbHits: policy.minKbHits,
+          resolveOnAutoSend: policy.resolveOnAutoSend,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? 'Save failed');
+
+      setPolicy(data);
+      setPolicySuccess(true);
+      setTimeout(() => setPolicySuccess(false), 3000);
+    } catch (err) {
+      setPolicyError(err instanceof Error ? err.message : 'Save failed');
+    } finally {
+      setPolicySaving(false);
+    }
+  }
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -89,14 +152,11 @@ export default function SettingsPage() {
         body: JSON.stringify({
           name,
           domain,
-          chatwoot_account_id: chatwootAccountId ? Number(chatwootAccountId) : null,
-          chatwoot_inbox_id: chatwootInboxId ? Number(chatwootInboxId) : null,
           resend_domain_id: resendDomainId || null,
           settings: {
             ...tenant.settings,
             brand_color: brandColor,
             ai_tone: aiTone,
-            auto_resolve_threshold: autoResolveThreshold,
           },
         }),
       });
@@ -234,62 +294,165 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Auto-Resolve Confidence Threshold: {autoResolveThreshold}%
-            </label>
-            <p className="text-xs text-gray-400 mb-3">
-              Tickets with AI confidence above this threshold are auto-resolved without human review.
-            </p>
-            <input
-              type="range"
-              min={50}
-              max={99}
-              value={autoResolveThreshold}
-              onChange={(e) => setAutoResolveThreshold(Number(e.target.value))}
-              className="w-full accent-gray-900"
-            />
-            <div className="flex justify-between text-xs text-gray-400 mt-1">
-              <span>50% (aggressive)</span>
-              <span>99% (conservative)</span>
+        </section>
+
+        {/* Auto-resolve policy */}
+        <section className="bg-white rounded-lg border border-gray-200 p-6">
+          <h2 className="text-base font-semibold text-gray-900 mb-1">Auto-resolve policy</h2>
+          <p className="text-xs text-gray-400 mb-4">
+            Controls when AI replies are sent automatically vs held as a draft. Each tenant has its own policy.
+          </p>
+
+          {!policy ? (
+            <div className="text-gray-400 text-sm">Loading policy…</div>
+          ) : (
+            <div className="space-y-5">
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={policy.autoSendEnabled}
+                  onChange={(e) => setPolicy({ ...policy, autoSendEnabled: e.target.checked })}
+                  className="h-4 w-4 accent-gray-900"
+                />
+                <span className="text-sm text-gray-700">
+                  Enable auto-send
+                  <span className="block text-xs text-gray-400">
+                    When off, every AI reply is saved as a draft for human review.
+                  </span>
+                </span>
+              </label>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Confidence threshold: {Math.round(policy.confidenceThreshold * 100)}%
+                </label>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={Math.round(policy.confidenceThreshold * 100)}
+                  onChange={(e) =>
+                    setPolicy({ ...policy, confidenceThreshold: Number(e.target.value) / 100 })
+                  }
+                  className="w-full accent-gray-900"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Min KB similarity: {Math.round(policy.minKbSimilarity * 100)}%
+                  </label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(policy.minKbSimilarity * 100)}
+                    onChange={(e) =>
+                      setPolicy({ ...policy, minKbSimilarity: Number(e.target.value) / 100 })
+                    }
+                    className="w-full accent-gray-900"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Min KB hits
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={20}
+                    value={policy.minKbHits}
+                    onChange={(e) =>
+                      setPolicy({ ...policy, minKbHits: Math.max(0, Math.min(20, Number(e.target.value) || 0)) })
+                    }
+                    className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Allowed ticket types</label>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {TICKET_TYPE_OPTIONS.map((opt) => (
+                    <label key={opt.value} className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={policy.allowedTypes.includes(opt.value)}
+                        onChange={(e) =>
+                          setPolicy({
+                            ...policy,
+                            allowedTypes: e.target.checked
+                              ? [...policy.allowedTypes, opt.value]
+                              : policy.allowedTypes.filter((t) => t !== opt.value),
+                          })
+                        }
+                        className="h-4 w-4 accent-gray-900"
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Allowed urgencies</label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {URGENCY_OPTIONS.map((opt) => (
+                    <label key={opt.value} className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={policy.allowedUrgencies.includes(opt.value)}
+                        onChange={(e) =>
+                          setPolicy({
+                            ...policy,
+                            allowedUrgencies: e.target.checked
+                              ? [...policy.allowedUrgencies, opt.value]
+                              : policy.allowedUrgencies.filter((u) => u !== opt.value),
+                          })
+                        }
+                        className="h-4 w-4 accent-gray-900"
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={policy.resolveOnAutoSend}
+                  onChange={(e) => setPolicy({ ...policy, resolveOnAutoSend: e.target.checked })}
+                  className="h-4 w-4 accent-gray-900"
+                />
+                <span className="text-sm text-gray-700">Mark ticket resolved after auto-sending</span>
+              </label>
+
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleSavePolicy}
+                  disabled={policySaving}
+                  className="bg-gray-900 text-white text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {policySaving ? 'Saving…' : 'Save policy'}
+                </button>
+                {policySuccess && <span className="text-sm text-green-700">Policy saved.</span>}
+                {policyError && <span className="text-sm text-red-700">{policyError}</span>}
+              </div>
             </div>
-          </div>
+          )}
         </section>
 
         {/* Inbox Configuration */}
         <section className="bg-white rounded-lg border border-gray-200 p-6">
           <h2 className="text-base font-semibold text-gray-900 mb-4">Inbox Configuration</h2>
           <p className="text-xs text-gray-400 mb-4">
-            Configure Chatwoot and Resend for this tenant's email support.
+            Configure Resend for this tenant's inbound and outbound email.
           </p>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Chatwoot Account ID
-              </label>
-              <input
-                type="number"
-                value={chatwootAccountId}
-                onChange={(e) => setChatwootAccountId(e.target.value)}
-                placeholder="1"
-                className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Chatwoot Inbox ID
-              </label>
-              <input
-                type="number"
-                value={chatwootInboxId}
-                onChange={(e) => setChatwootInboxId(e.target.value)}
-                placeholder="1"
-                className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
-              />
-            </div>
-
             <div className="sm:col-span-2">
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 Resend Domain ID

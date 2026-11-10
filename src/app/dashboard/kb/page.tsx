@@ -93,11 +93,11 @@ export default function KBPage() {
           throw new Error(data.error ?? 'Update failed');
         }
       } else {
-        // Create — use tenant slug as product if available
+        // Create — the server sets the tenant and product from the session
         const res = await fetch('/api/kb', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...form, product: 'unknown', tenant_id: tenantId }),
+          body: JSON.stringify({ ...form, tenant_id: tenantId }),
         });
         if (!res.ok) {
           const data = await res.json();

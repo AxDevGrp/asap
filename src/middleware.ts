@@ -72,7 +72,7 @@ export const config = {
      * Match all paths except:
      * - _next/static, _next/image (Next.js internals)
      * - favicon.ico, public files
-     * - /api/webhook/* (Chatwoot inbound — no user auth)
+     * - /api/webhook/* (Resend inbound email — no user auth)
      */
     '/((?!_next/static|_next/image|favicon.ico|api/webhook).*)',
   ],

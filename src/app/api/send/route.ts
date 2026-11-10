@@ -1,6 +1,8 @@
 // POST /api/send — send an outbound reply email to a customer via Resend
 //
 // This endpoint sends a reply on behalf of a tenant using their custom domain.
+// Signed-in tenant members only; the reply must belong to one of the tenant's
+// tickets and go to that ticket's contact (so it can't be used to send arbitrary mail).
 // It logs the send attempt to outbound_messages for delivery tracking.
 //
 // Request body:
@@ -10,8 +12,7 @@
 //   subject: string            — email subject
 //   text: string               — plain-text body
 //   html?: string              — optional HTML body
-//   ticketId?: string          — link to internal ticket (for tracking)
-//   chatwootConvoId?: number   — link to Chatwoot conversation (for tracking)
+//   ticketId: string           — the tenant's ticket being replied to (required)
 //   inReplyTo?: string         — Message-ID to thread into (RFC 2822)
 //   references?: string        — References header for threading
 // }
@@ -21,10 +22,12 @@ import { createClient } from '@supabase/supabase-js';
 import { getTenantById } from '@/lib/tenant';
 import { sendEmail } from '@/lib/resend';
 import { createOutboundMessage } from '@/lib/db';
+import { requireTenantMember } from '@/lib/auth';
+import { checkApiWriteLimit } from '@/lib/rate-limit';
 
 function getServiceSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
   return createClient(url, key);
 }
 
@@ -50,7 +53,6 @@ export async function POST(request: NextRequest) {
     text,
     html,
     ticketId,
-    chatwootConvoId,
     inReplyTo,
     references,
   } = body as {
@@ -60,15 +62,38 @@ export async function POST(request: NextRequest) {
     text?: string;
     html?: string;
     ticketId?: string;
-    chatwootConvoId?: number;
     inReplyTo?: string;
     references?: string;
   };
 
   // ── Validate required fields ─────────────────────────────────────────────
-  if (!tenantId || !to || !subject || !text) {
+  if (!tenantId || !to || !subject || !text || !ticketId) {
     return NextResponse.json(
-      { error: 'tenantId, to, subject, and text are required' },
+      { error: 'tenantId, ticketId, to, subject, and text are required' },
+      { status: 400 }
+    );
+  }
+
+  // ── Auth: signed-in member of this tenant ───────────────────────────────
+  const member = await requireTenantMember(tenantId);
+  if ('error' in member) return member.error;
+  if (!checkApiWriteLimit(tenantId)) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
+  }
+
+  // ── The ticket must be this tenant's, and we only reply to its contact ──
+  const { data: ticket, error: ticketError } = await getDb()
+    .from('tickets')
+    .select('id, tenant_id, contact_email')
+    .eq('id', ticketId)
+    .eq('tenant_id', tenantId)
+    .maybeSingle();
+  if (ticketError || !ticket) {
+    return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+  }
+  if (!ticket.contact_email || ticket.contact_email.toLowerCase() !== to.trim().toLowerCase()) {
+    return NextResponse.json(
+      { error: "Replies can only be sent to the ticket's contact" },
       { status: 400 }
     );
   }
@@ -89,8 +114,7 @@ export async function POST(request: NextRequest) {
   // ── Log the send attempt (pending) ──────────────────────────────────────
   const outboundRecord = await createOutboundMessage({
     tenant_id: tenantId,
-    ticket_id: ticketId ?? null,
-    chatwoot_convo_id: chatwootConvoId ?? null,
+    ticket_id: ticketId,
     to_email: to,
     from_email: fromEmail,
     subject,

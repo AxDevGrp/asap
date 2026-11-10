@@ -1,8 +1,8 @@
 // RAG layer — retrieve relevant KB articles and generate a grounded draft reply
 
 import { supabase } from './supabase';
-import { embedText } from './embeddings';
-import { TriageResult } from '@/types/chatwoot';
+import { embedQuery } from './embeddings';
+import { TriageResult } from '@/types/triage';
 
 export interface KBArticle {
   id: string;
@@ -24,9 +24,9 @@ export async function searchKB(
 ): Promise<KBArticle[]> {
   let embedding: number[];
   try {
-    embedding = await embedText(query);
+    embedding = await embedQuery(query);
   } catch (err) {
-    console.error('[RAG] embedText failed:', err);
+    console.error('[RAG] embedQuery failed:', err);
     return [];
   }
 

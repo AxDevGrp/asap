@@ -1,14 +1,28 @@
 // POST /api/tenants — create a new tenant
-// GET  /api/tenants — list all tenants
+// GET  /api/tenants — list the tenants the signed-in user belongs to
 
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { createServerClient } from '@supabase/ssr';
 import { listTenants } from '@/lib/tenant';
-import { createSupabaseAdminClient } from '@/lib/supabase-server';
+import { createSupabaseAdminClient, createSupabaseServerClient } from '@/lib/supabase-server';
+import { unauthorizedResponse } from '@/lib/auth';
 
 export async function GET() {
-  const tenants = await listTenants();
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return unauthorizedResponse();
+
+  const { data: memberships, error } = await supabase
+    .from('tenant_memberships')
+    .select('tenant_id')
+    .eq('user_id', user.id);
+  if (error) {
+    return NextResponse.json({ error: 'Membership lookup failed' }, { status: 500 });
+  }
+
+  const ids = new Set((memberships ?? []).map((m) => m.tenant_id as string));
+  const tenants = (await listTenants()).filter((t) => ids.has(t.id));
   return NextResponse.json(tenants);
 }
 
