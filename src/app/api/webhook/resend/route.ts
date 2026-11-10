@@ -302,7 +302,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: message }, { status: 500 });
     }
 
-    kickJobRunner();
+    await kickJobRunner();
 
     return NextResponse.json(
       {

@@ -224,7 +224,11 @@ export async function runDueJobs(opts: {
  * Best-effort nudge to the runner. Fire-and-forget with a short timeout so an
  * inbound webhook never waits on the pipeline. A scheduler is the backstop.
  */
-export function kickJobRunner(): void {
+export async function kickJobRunner(): Promise<void> {
+  // Awaited by callers: on serverless hosts (Vercel) an un-awaited fetch can be
+  // frozen once the response is sent, so the kick would never leave. We only
+  // wait until the request is dispatched (or 1.5s), not for the run to finish;
+  // the runner keeps going after we abort. The scheduler is the safety net.
   const appUrl = process.env.APP_URL;
   const secret = process.env.JOBS_SECRET ?? process.env.CRON_SECRET;
   if (!appUrl || !secret) return;
@@ -232,13 +236,15 @@ export function kickJobRunner(): void {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 1500);
 
-  fetch(`${appUrl.replace(/\/$/, '')}/api/jobs/run`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${secret}` },
-    signal: controller.signal,
-  })
-    .catch(() => {
-      // best-effort: scheduler will pick the job up
-    })
-    .finally(() => clearTimeout(timer));
+  try {
+    await fetch(`${appUrl.replace(/\/$/, '')}/api/jobs/run`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}` },
+      signal: controller.signal,
+    });
+  } catch {
+    // best-effort: scheduler will pick the job up
+  } finally {
+    clearTimeout(timer);
+  }
 }
