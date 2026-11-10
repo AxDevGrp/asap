@@ -77,7 +77,8 @@ export async function processInboundEmail(
   let replyText = '';
   let kbArticles: KBArticle[] = [];
   try {
-    kbArticles = await searchKB(body, slug, 3, 0.5, tenant.id);
+    // 0.6 cutoff: with gemini-embedding-2, real matches score ~0.7+, unrelated text ~0.5.
+    kbArticles = await searchKB(body, slug, 3, 0.6, tenant.id);
     if (isFollowUp) {
       const allMessages = await getMessagesByTicketId(ticketId);
       const history = allMessages

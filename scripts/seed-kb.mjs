@@ -5,19 +5,21 @@
 //
 // Usage:
 //   node --env-file=.env.local scripts/seed-kb.mjs
-// Requires in env: NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GOOGLE_API_KEY.
+// Requires in env: NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENROUTER_API_KEY.
+// Optional: AI_BASE_URL, AI_EMBEDDING_MODEL (defaults match src/lib/llm.ts).
 // Optional: SEED_TENANT_SLUG (default 'goasap').
 //
-// Embedding model must match src/lib/embeddings.ts (768-dim, knowledge_base.embedding).
+// Embedding model and format must match src/lib/embeddings.ts (768-dim).
 
 import { createClient } from '@supabase/supabase-js';
 
-const EMBEDDING_MODEL = 'gemini-embedding-2';
+const EMBEDDING_MODEL = process.env.AI_EMBEDDING_MODEL || 'google/gemini-embedding-2';
+const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
 const EMBEDDING_DIMENSIONS = 768;
-const { NEXT_PUBLIC_SUPABASE_URL: url, SUPABASE_SERVICE_ROLE_KEY: serviceKey, GOOGLE_API_KEY: googleKey } = process.env;
+const { NEXT_PUBLIC_SUPABASE_URL: url, SUPABASE_SERVICE_ROLE_KEY: serviceKey, OPENROUTER_API_KEY: aiKey } = process.env;
 const TENANT_SLUG = process.env.SEED_TENANT_SLUG || 'goasap';
 
-for (const [name, value] of Object.entries({ NEXT_PUBLIC_SUPABASE_URL: url, SUPABASE_SERVICE_ROLE_KEY: serviceKey, GOOGLE_API_KEY: googleKey })) {
+for (const [name, value] of Object.entries({ NEXT_PUBLIC_SUPABASE_URL: url, SUPABASE_SERVICE_ROLE_KEY: serviceKey, OPENROUTER_API_KEY: aiKey })) {
   if (!value) {
     console.error(`Missing ${name}. Run with: node --env-file=.env.local scripts/seed-kb.mjs`);
     process.exit(1);
@@ -48,23 +50,23 @@ const articles = [
 
 // Same document format as embedDocument() in src/lib/embeddings.ts.
 async function embedDocument(title, content) {
-  const text = `title: ${title} | text: ${content}`;
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': googleKey },
-      body: JSON.stringify({
-        model: `models/${EMBEDDING_MODEL}`,
-        content: { parts: [{ text }] },
-        output_dimensionality: EMBEDDING_DIMENSIONS,
-      }),
-    }
-  );
-  if (!res.ok) throw new Error(`Embedding API error ${res.status}: ${await res.text()}`);
-  const values = (await res.json())?.embedding?.values;
-  if (!Array.isArray(values) || values.length !== EMBEDDING_DIMENSIONS) throw new Error('Unexpected embedding response');
-  return values;
+  const res = await fetch(`${AI_BASE_URL}/embeddings`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${aiKey}`, 'Content-Type': 'application/json', 'X-Title': 'ASAP' },
+    body: JSON.stringify({
+      model: EMBEDDING_MODEL,
+      input: [`title: ${title} | text: ${content}`],
+      dimensions: EMBEDDING_DIMENSIONS,
+    }),
+  });
+  if (!res.ok) throw new Error(`Embedding API error ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  const v = (await res.json())?.data?.[0]?.embedding;
+  if (!Array.isArray(v) || v.length < EMBEDDING_DIMENSIONS) throw new Error('Unexpected embedding response');
+  if (v.length === EMBEDDING_DIMENSIONS) return v;
+  // Matryoshka model returned a longer vector: truncate and re-normalize.
+  const cut = v.slice(0, EMBEDDING_DIMENSIONS);
+  const norm = Math.sqrt(cut.reduce((a, x) => a + x * x, 0)) || 1;
+  return cut.map((x) => x / norm);
 }
 
 async function seed() {

@@ -2,6 +2,7 @@
 
 import { supabase } from './supabase';
 import { embedQuery } from './embeddings';
+import { chatCompletion, getAiApiKey } from './llm';
 import { TriageResult } from '@/types/triage';
 
 export interface KBArticle {
@@ -69,9 +70,8 @@ export async function generateRagReply(
     );
   }
 
-  const apiKey = process.env.GOOGLE_API_KEY;
-  if (!apiKey) {
-    console.warn('[RAG] GOOGLE_API_KEY not set — returning triage suggested_reply');
+  if (!getAiApiKey()) {
+    console.warn('[RAG] OPENROUTER_API_KEY not set — returning triage suggested_reply');
     return triage.suggested_reply ?? `Hi ${contactName ?? 'there'}, thanks for reaching out to ${productName} support!`;
   }
 
@@ -93,35 +93,15 @@ ${context}
 
 Write a support reply:`;
 
-  const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
-  const response = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'gemma-4-26b-a4b-it',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    console.error(`[RAG] Gemini reply error ${response.status}: ${err}`);
+  try {
+    return await chatCompletion([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ]);
+  } catch (err) {
+    console.error('[RAG] reply failed:', err);
     return triage.suggested_reply ?? `Hi ${contactName ?? 'there'}, thanks for contacting ${productName} support!`;
   }
-
-  const data = await response.json();
-  let content: string = data.choices?.[0]?.message?.content ?? '';
-
-  // Strip thinking blocks if present
-  content = content.replace(/<thought>[\s\S]*?<\/thought>\s*/g, '').trim();
-
-  return content || (triage.suggested_reply ?? `Hi ${contactName ?? 'there'}, thanks for reaching out!`);
 }
 
 /**
@@ -136,9 +116,8 @@ export async function generateFollowUpReply(
   productName: string,
   contactName?: string | null
 ): Promise<string> {
-  const apiKey = process.env.GOOGLE_API_KEY;
-  if (!apiKey) {
-    console.warn('[RAG] GOOGLE_API_KEY not set — returning generic follow-up');
+  if (!getAiApiKey()) {
+    console.warn('[RAG] OPENROUTER_API_KEY not set — returning generic follow-up');
     return `Hi ${contactName ?? 'there'}, thanks for the follow-up! We're looking into this and will get back to you shortly.`;
   }
 
@@ -166,33 +145,13 @@ ${context}
 
 Write a follow-up support reply:`;
 
-  const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
-  const response = await fetch(`${GEMINI_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'gemma-4-26b-a4b-it',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    console.error(`[RAG] Gemini follow-up error ${response.status}: ${err}`);
+  try {
+    return await chatCompletion([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ]);
+  } catch (err) {
+    console.error('[RAG] follow-up reply failed:', err);
     return `Hi ${contactName ?? 'there'}, thanks for the follow-up! We're looking into this and will get back to you.`;
   }
-
-  const data = await response.json();
-  let content: string = data.choices?.[0]?.message?.content ?? '';
-
-  // Strip thinking blocks if present
-  content = content.replace(/<thought>[\s\S]*?<\/thought>\s*/g, '').trim();
-
-  return content || `Hi ${contactName ?? 'there'}, thanks for the follow-up! We're looking into this.`;
 }

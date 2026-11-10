@@ -17,8 +17,9 @@ An AI-first customer support platform. Incoming emails arrive via Resend, are tr
 - **Language**: TypeScript
 - **Styling**: Tailwind CSS
 - **Database**: Supabase (PostgreSQL + pgvector for RAG)
-- **AI Triage**: Gemma 4 26B via Gemini API
-- **Embeddings**: Google gemini-embedding-2 (768-dim)
+- **AI gateway**: OpenRouter (`src/lib/llm.ts`); model is an env setting
+- **AI Triage + drafts**: Gemma 4 26B (`google/gemma-4-26b-a4b-it`)
+- **Embeddings**: Google gemini-embedding-2 via OpenRouter (768-dim)
 - **Email**: Resend (inbound webhooks + outbound replies)
 - **Validation**: Zod
 
@@ -44,7 +45,8 @@ An AI-first customer support platform. Incoming emails arrive via Resend, are tr
 │   ├── lib/
 │   │   ├── pipeline.ts      # Channel-agnostic AI pipeline (triage → KB → draft)
 │   │   ├── db.ts            # Supabase data layer
-│   │   ├── embeddings.ts    # Google gemini-embedding-2
+│   │   ├── embeddings.ts    # KB embeddings (gemini-embedding-2 via OpenRouter)
+│   │   ├── llm.ts           # AI gateway client (OpenRouter)
 │   │   ├── gemini.ts        # AI triage (Gemma 4 26B)
 │   │   ├── rag.ts           # RAG search + reply generation
 │   │   ├── auto-resolve.ts  # Auto-resolve policy
@@ -96,7 +98,8 @@ Slow work (triage → KB → draft → auto-resolve) does not run inside the inb
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anonymous key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service-role key (server-side writes) |
-| `GOOGLE_API_KEY` | Google API key (Gemini + embeddings) |
+| `OPENROUTER_API_KEY` | OpenRouter key for all AI calls (triage, drafts, embeddings) |
+| `AI_CHAT_MODEL` / `AI_EMBEDDING_MODEL` / `AI_BASE_URL` | Optional model/provider overrides |
 | `RESEND_API_KEY` | Resend API key for sending and fetching received email bodies |
 | `RESEND_WEBHOOK_SECRET` | Resend/Svix webhook signing secret |
 | `APP_URL` | App URL for callbacks |
