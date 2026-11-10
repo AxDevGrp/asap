@@ -1,0 +1,10 @@
+# Never upload local secrets or tooling state
+.env
+.env.*
+!.env.example
+supabase/.temp
+supabase/.branches
+.codex
+.pandacode
+.DS_Store
+*.tsbuildinfo
