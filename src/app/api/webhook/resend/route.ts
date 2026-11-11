@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createHmac, timingSafeEqual } from 'crypto';
+import { verifySvixSignature } from '@/lib/svix';
 import { getTenantByDomain } from '@/lib/tenant';
 import {
   findOrCreateConversation,
@@ -15,45 +15,7 @@ import { JOB_TYPE_INBOUND_EMAIL_PROCESS } from '@/lib/job-handlers';
 import { getReceivedEmail } from '@/lib/resend';
 import { checkWebhookLimit } from '@/lib/rate-limit';
 
-// ── Svix webhook signature verification ─────────────────────────────────────────
-// Resend sends Svix-signed webhooks. We verify manually with Node crypto so
-// we don't need to add the svix package (keeps dependencies unchanged).
-
-function verifySvixSignature(
-  payload: string,
-  secret: string,
-  id: string,
-  timestamp: string,
-  signatureHeader: string
-): boolean {
-  const signedContent = `${id}.${timestamp}.${payload}`;
-  const expectedSig = createHmac('sha256', secret)
-    .update(signedContent)
-    .digest('base64');
-
-  const signatures = signatureHeader
-    .split(' ')
-    .filter((s) => s.startsWith('v1='))
-    .map((s) => s.slice(3));
-
-  if (signatures.length === 0) return false;
-
-  const expectedBuf = Buffer.from(expectedSig, 'base64');
-  for (const sig of signatures) {
-    try {
-      const sigBuf = Buffer.from(sig, 'base64');
-      if (
-        sigBuf.length === expectedBuf.length &&
-        timingSafeEqual(sigBuf, expectedBuf)
-      ) {
-        return true;
-      }
-    } catch {
-      // ignore invalid base64
-    }
-  }
-  return false;
-}
+// Svix signature verification lives in src/lib/svix.ts.
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
 
