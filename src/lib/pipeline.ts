@@ -11,6 +11,7 @@ import {
   getOutboundMessageByIdempotencyKey,
   updateOutboundMessage,
   createMessage,
+  urgencyToPriority,
 } from '@/lib/db';
 import type { Tenant } from '@/lib/tenant';
 import { searchKB, generateRagReply, generateFollowUpReply, KBArticle } from '@/lib/rag';
@@ -67,6 +68,7 @@ export async function processInboundEmail(
         triage_urgency: triage.urgency,
         triage_summary: triage.summary,
         triage_confidence: triage.confidence,
+        priority: urgencyToPriority(triage.urgency),
       });
     } catch (err) {
       console.error('[Pipeline] Triage failed:', err);
@@ -160,7 +162,7 @@ export async function processInboundEmail(
           auto_reply_text: replyText,
           auto_resolved: policy.resolveOnAutoSend,
           resolve_reason: `${reason} (already sent)`,
-          status: policy.resolveOnAutoSend ? 'resolved' : 'open',
+          status: policy.resolveOnAutoSend ? 'resolved' : 'todo',
         });
         return {
           draft: replyText || null,
@@ -194,7 +196,7 @@ export async function processInboundEmail(
         auto_reply_text: replyText,
         auto_resolved: policy.resolveOnAutoSend,
         resolve_reason: `${reason} (already sent)`,
-        status: policy.resolveOnAutoSend ? 'resolved' : 'open',
+        status: policy.resolveOnAutoSend ? 'resolved' : 'todo',
       });
     } else {
       const sent = await sendEmail({
@@ -235,7 +237,7 @@ export async function processInboundEmail(
           auto_reply_text: replyText,
           auto_resolved: policy.resolveOnAutoSend,
           resolve_reason: reason,
-          status: policy.resolveOnAutoSend ? 'resolved' : 'open',
+          status: policy.resolveOnAutoSend ? 'resolved' : 'todo',
         });
       } else {
         console.error('[Pipeline] Auto-send failed, keeping as draft:', sent.error);
