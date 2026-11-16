@@ -1,6 +1,7 @@
 // Channel-agnostic AI pipeline: triage -> KB search -> draft reply -> auto-resolve decision.
 // Inbound email (Resend webhook) calls this; nothing here knows about any inbox provider.
 
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { triageTicket } from '@/lib/gemini';
 import {
   updateTicket,
@@ -12,7 +13,15 @@ import {
   updateOutboundMessage,
   createMessage,
   urgencyToPriority,
+  type TicketStatus,
 } from '@/lib/db';
+import { supabase } from '@/lib/supabase';
+import { canTransition } from '@/lib/tickets/status';
+import {
+  InvalidTransitionError,
+  transitionTicket,
+  type Actor,
+} from '@/lib/tickets/service';
 import type { Tenant } from '@/lib/tenant';
 import { searchKB, generateRagReply, generateFollowUpReply, KBArticle } from '@/lib/rag';
 import { shouldAutoResolve } from '@/lib/auto-resolve';
@@ -40,6 +49,80 @@ export interface ProcessInboundEmailResult {
   triage: Partial<TriageResult> | null;
   kbHits: number;
   topKbSimilarity: number | null;
+}
+
+const SYSTEM_ACTOR: Actor = { type: 'system' };
+
+async function currentTicketStatus(
+  client: SupabaseClient<any>,
+  ticketId: string
+): Promise<TicketStatus | null> {
+  const { data, error } = await client
+    .from('tickets')
+    .select('status')
+    .eq('id', ticketId)
+    .maybeSingle();
+  if (error) throw error;
+  return ((data as { status?: TicketStatus } | null)?.status ?? null);
+}
+
+async function safeTransition(
+  client: SupabaseClient<any>,
+  ticketId: string,
+  from: TicketStatus,
+  to: TicketStatus
+): Promise<void> {
+  if (!canTransition(from, to)) return;
+  try {
+    await transitionTicket(ticketId, to, SYSTEM_ACTOR, { client });
+  } catch (err) {
+    // Retries may race another writer; an illegal transition is not fatal.
+    if (err instanceof InvalidTransitionError) return;
+    throw err;
+  }
+}
+
+/**
+ * Move a ticket after a successful auto-send. Retry-safe: a ticket already in
+ * the target state is left alone instead of throwing.
+ *
+ * resolveOnAutoSend → resolved.
+ * otherwise → triage becomes todo then waiting_on_customer; todo/in_progress
+ * becomes waiting_on_customer; anything else (already waiting, closed) is left.
+ */
+export async function applyAutoSendStatus(
+  ticketId: string,
+  resolveOnAutoSend: boolean,
+  client: SupabaseClient<any> = supabase
+): Promise<void> {
+  const status = await currentTicketStatus(client, ticketId);
+  if (!status) return;
+
+  if (resolveOnAutoSend) {
+    await safeTransition(client, ticketId, status, 'resolved');
+    return;
+  }
+
+  if (status === 'triage') {
+    await safeTransition(client, ticketId, status, 'todo');
+    const after = await currentTicketStatus(client, ticketId);
+    if (after === 'todo' || after === 'in_progress') {
+      await safeTransition(client, ticketId, after, 'waiting_on_customer');
+    }
+    return;
+  }
+
+  if (status === 'todo' || status === 'in_progress') {
+    await safeTransition(client, ticketId, status, 'waiting_on_customer');
+  }
+}
+
+/**
+ * Post-triage hook. This is a no-op seam: later milestones (triage rules, AI
+ * agent delegation) plug their work in here.
+ */
+export async function afterTriage(_ticketId: string): Promise<void> {
+  // intentionally empty
 }
 
 export async function processInboundEmail(
@@ -148,6 +231,7 @@ export async function processInboundEmail(
             top_kb_similarity: topKbSimilarity,
             policy_version: policy.version,
           });
+          await afterTriage(ticketId);
           return {
             draft: replyText || null,
             autoSent: false,
@@ -162,8 +246,9 @@ export async function processInboundEmail(
           auto_reply_text: replyText,
           auto_resolved: policy.resolveOnAutoSend,
           resolve_reason: `${reason} (already sent)`,
-          status: policy.resolveOnAutoSend ? 'resolved' : 'todo',
         });
+        await applyAutoSendStatus(ticketId, policy.resolveOnAutoSend);
+        await afterTriage(ticketId);
         return {
           draft: replyText || null,
           autoSent: true,
@@ -196,8 +281,8 @@ export async function processInboundEmail(
         auto_reply_text: replyText,
         auto_resolved: policy.resolveOnAutoSend,
         resolve_reason: `${reason} (already sent)`,
-        status: policy.resolveOnAutoSend ? 'resolved' : 'todo',
       });
+      await applyAutoSendStatus(ticketId, policy.resolveOnAutoSend);
     } else {
       const sent = await sendEmail({
         tenantDomain: tenant.domain,
@@ -237,8 +322,8 @@ export async function processInboundEmail(
           auto_reply_text: replyText,
           auto_resolved: policy.resolveOnAutoSend,
           resolve_reason: reason,
-          status: policy.resolveOnAutoSend ? 'resolved' : 'todo',
         });
+        await applyAutoSendStatus(ticketId, policy.resolveOnAutoSend);
       } else {
         console.error('[Pipeline] Auto-send failed, keeping as draft:', sent.error);
         if (outbound) {
@@ -271,6 +356,8 @@ export async function processInboundEmail(
     top_kb_similarity: topKbSimilarity,
     policy_version: policy.version,
   });
+
+  await afterTriage(ticketId);
 
   return {
     draft: replyText || null,

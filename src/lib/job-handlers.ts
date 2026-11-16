@@ -20,6 +20,7 @@ export interface InboundEmailProcessPayload {
   subject: string;
   body: string;
   isFollowUp?: boolean;
+  routing?: { action: string; effects?: string[] };
 }
 
 export interface Job {
