@@ -449,7 +449,7 @@ export default function SettingsPage() {
         <section className="bg-white rounded-lg border border-gray-200 p-6">
           <h2 className="text-base font-semibold text-gray-900 mb-4">Inbox Configuration</h2>
           <p className="text-xs text-gray-400 mb-4">
-            Configure Resend for this tenant's inbound and outbound email.
+            Configure Resend for this tenant&apos;s inbound and outbound email.
           </p>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
