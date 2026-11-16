@@ -298,7 +298,7 @@ export default function OnboardingPage() {
           <div className="bg-white rounded-lg border border-gray-200 p-8">
             <h1 className="text-2xl font-bold mb-2">Register your domain</h1>
             <p className="text-gray-500 text-sm mb-8">
-              We'll register <strong>{tenant.domain}</strong> with Resend for email delivery.
+              We&apos;ll register <strong>{tenant.domain}</strong> with Resend for email delivery.
               This enables ASAP to send replies from <strong>support@{tenant.domain}</strong>.
             </p>
 
@@ -306,7 +306,7 @@ export default function OnboardingPage() {
               <div className="font-medium mb-1">What happens next:</div>
               <ol className="list-decimal pl-4 space-y-1">
                 <li>We register your domain with Resend (our email provider)</li>
-                <li>You'll get DNS records to add to your domain registrar (e.g. Cloudflare)</li>
+                <li>You&apos;ll get DNS records to add to your domain registrar (e.g. Cloudflare)</li>
                 <li>Once DNS propagates, your domain is verified and email is ready</li>
               </ol>
             </div>
@@ -377,7 +377,7 @@ export default function OnboardingPage() {
                 onClick={enterDnsStep}
                 className="flex-1 bg-gray-900 text-white py-2.5 rounded-md text-sm font-medium hover:bg-gray-700 transition-colors"
               >
-                I've added the records →
+                I&apos;ve added the records →
               </button>
               <button
                 onClick={skipToComplete}
@@ -445,7 +445,7 @@ export default function OnboardingPage() {
         {step === 'complete' && tenant && (
           <div className="bg-white rounded-lg border border-gray-200 p-8 text-center">
             <div className="text-5xl mb-4">🎉</div>
-            <h1 className="text-2xl font-bold mb-2">You're all set!</h1>
+            <h1 className="text-2xl font-bold mb-2">You&apos;re all set!</h1>
             <p className="text-gray-500 text-sm mb-8">
               <strong>{tenant.name}</strong> is ready on ASAP. Your next step is to add
               knowledge base articles so the AI can start answering customer questions.

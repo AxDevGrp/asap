@@ -70,3 +70,10 @@ Priority: `none | low | medium | high | urgent`. Ticket IDs: `<PREFIX>-<n>` per 
 * **9 · SLAs** — First-response and resolution targets by priority and contact tier, business hours, at-risk/breach detection, escalation, SLA UI.
 * **10 · Closing the loop** — When a ticket is resolved, every linked contact gets a personal AI-written update (human-confirmed unless auto-send).
 * **11 · Hardening** — Metrics, end-to-end simulation, security and tenant-isolation suite, docs and runbook.
+
+## Tests
+
+* `npm test` — Vitest unit tests (`src/**/*.test.ts`). `npm run test:watch` for watch mode.
+* `npm run lint` — ESLint (`next/core-web-vitals`), non-interactive.
+* `scripts/test-db.sh` — resets the **local** Supabase DB (`supabase db reset`) and runs every `scripts/sql-tests/*.sql` file with `psql`, printing PASS/FAIL per file. Needs Docker/colima running and `supabase start` first; it refuses arguments and non-local `TEST_DB_URL`.
+* CI (`.github/workflows/ci.yml`) runs typecheck, lint, tests and build on push/PR to `main`.

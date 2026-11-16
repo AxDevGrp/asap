@@ -9,7 +9,6 @@ export const JOB_TYPE_INBOUND_EMAIL_PROCESS = 'inbound_email.process' as const;
 
 export type JobType =
   | typeof JOB_TYPE_INBOUND_EMAIL_PROCESS
-  // eslint-disable-next-line @typescript-eslint/ban-types
   | (string & {});
 
 export interface InboundEmailProcessPayload {
