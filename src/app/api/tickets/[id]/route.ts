@@ -1,133 +1,178 @@
-// GET  /api/tickets/[id]  — fetch ticket + messages + outbound messages
-// PATCH /api/tickets/[id] — update ticket status or owner (agent actions)
+// GET   /api/tickets/[id] — fetch ticket + messages + outbound messages
+// PATCH /api/tickets/[id] — status / priority / owner / title updates
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
-import { createSupabaseServerClient } from '@/lib/supabase-server';
+import { z } from 'zod';
+import { checkApiReadLimit, checkApiWriteLimit } from '@/lib/rate-limit';
+import { supabase } from '@/lib/supabase';
+import {
+  ConcurrentUpdateError,
+  InvalidTransitionError,
+  setOwner,
+  setPriority,
+  TicketNotFoundError,
+  transitionTicket,
+} from '@/lib/tickets/service';
+import {
+  loadTicketDetail,
+  resolveCallerTenant,
+  TICKET_PRIORITIES,
+} from '@/lib/tickets/query';
+import { TICKET_STATUSES } from '@/lib/tickets/status';
 
-function getServiceClient() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!
-  );
+type Params = { params: { id: string } };
+
+const patchSchema = z
+  .object({
+    status: z.enum(TICKET_STATUSES).optional(),
+    priority: z.enum(TICKET_PRIORITIES).optional(),
+    owner_id: z.string().uuid().nullable().optional(),
+    title: z.string().min(1).max(300).optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: 'At least one field is required',
+  });
+
+function rateLimited() {
+  return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
 }
 
-// ── Auth helper ────────────────────────────────────────────────────────────────
+export async function GET(request: NextRequest, { params }: Params) {
+  const tenant = await resolveCallerTenant(request);
+  if ('error' in tenant) return tenant.error;
 
-async function getAuthedTenantId(): Promise<string | null> {
-  const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return null;
+  if (!checkApiReadLimit(tenant.tenantId)) return rateLimited();
 
-  const { data } = await supabase
-    .from('tenant_memberships')
-    .select('tenant_id')
-    .eq('user_id', user.id)
-    .limit(1)
-    .single();
-
-  return data?.tenant_id ?? null;
-}
-
-// ── GET ────────────────────────────────────────────────────────────────────────
-
-export async function GET(
-  _req: NextRequest,
-  { params }: { params: { id: string } }
-) {
-  const tenantId = await getAuthedTenantId();
-  if (!tenantId) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  const db = getServiceClient();
-  const ticketId = params.id;
-
-  // Fetch ticket
-  const { data: ticket, error: ticketError } = await db
-    .from('tickets')
-    .select('*')
-    .eq('id', ticketId)
-    .eq('tenant_id', tenantId)
-    .single();
-
-  if (ticketError || !ticket) {
+  const detail = await loadTicketDetail(tenant.tenantId, { id: params.id });
+  if (!detail) {
     return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
   }
 
-  // Fetch messages (conversation thread)
-  const { data: messages } = await db
-    .from('messages')
-    .select('id, direction, content, sender_name, created_at')
-    .eq('ticket_id', ticketId)
-    .order('created_at', { ascending: true });
-
-  // Fetch outbound messages (sent via Resend)
-  const { data: outboundMessages } = await db
-    .from('outbound_messages')
-    .select('id, to_email, from_email, subject, body_text, status, created_at')
-    .eq('ticket_id', ticketId)
-    .order('created_at', { ascending: true });
-
-  return NextResponse.json({
-    ticket,
-    messages: messages ?? [],
-    outboundMessages: outboundMessages ?? [],
-  });
+  return NextResponse.json(detail);
 }
 
-// ── PATCH ──────────────────────────────────────────────────────────────────────
+export async function PATCH(request: NextRequest, { params }: Params) {
+  const tenant = await resolveCallerTenant(request);
+  if ('error' in tenant) return tenant.error;
 
-export async function PATCH(
-  req: NextRequest,
-  { params }: { params: { id: string } }
-) {
-  const tenantId = await getAuthedTenantId();
-  if (!tenantId) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  if (!checkApiWriteLimit(tenant.tenantId)) return rateLimited();
 
-  let body: Record<string, unknown>;
+  let body: unknown;
   try {
-    body = await req.json();
+    body = await request.json();
   } catch {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  // Only allow safe status/owner updates from the agent interface
-  const allowedFields = ['status', 'owner_id'];
-  const updates: Record<string, unknown> = {};
-  for (const field of allowedFields) {
-    if (field in body) updates[field] = body[field];
+  const parsed = patchSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: 'Invalid ticket update', issues: parsed.error.issues },
+      { status: 400 }
+    );
   }
 
-  const validStatuses = [
-    'triage',
-    'todo',
-    'in_progress',
-    'waiting_on_customer',
-    'waiting_on_approval',
-    'resolved',
-    'canceled',
-    'duplicate',
-  ];
-  if (updates.status && !validStatuses.includes(updates.status as string)) {
-    return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
-  }
+  const patch = parsed.data;
+  const ticketId = params.id;
 
-  const db = getServiceClient();
-  const { data: ticket, error } = await db
+  const { data: current, error: loadError } = await supabase
     .from('tickets')
-    .update({ ...updates, updated_at: new Date().toISOString() })
-    .eq('id', params.id)
-    .eq('tenant_id', tenantId)
+    .select('id')
+    .eq('id', ticketId)
+    .eq('tenant_id', tenant.tenantId)
+    .maybeSingle();
+
+  if (loadError) {
+    return NextResponse.json({ error: 'Failed to load ticket' }, { status: 500 });
+  }
+  if (!current) {
+    return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+  }
+
+  if (patch.owner_id) {
+    const { data: membership, error: membershipError } = await supabase
+      .from('tenant_memberships')
+      .select('user_id')
+      .eq('user_id', patch.owner_id)
+      .eq('tenant_id', tenant.tenantId)
+      .maybeSingle();
+
+    if (membershipError) {
+      return NextResponse.json(
+        { error: 'Failed to verify owner' },
+        { status: 500 }
+      );
+    }
+    if (!membership) {
+      return NextResponse.json(
+        { error: 'owner_id must be a member of this workspace' },
+        { status: 400 }
+      );
+    }
+  }
+
+  const actor = { type: 'user' as const, id: tenant.userId };
+
+  try {
+    // Status first, as required by the transition rules.
+    if (patch.status !== undefined) {
+      await transitionTicket(ticketId, patch.status, actor, {
+        tenantId: tenant.tenantId,
+      });
+    }
+
+    if (patch.priority !== undefined) {
+      await setPriority(ticketId, patch.priority, actor, {
+        tenantId: tenant.tenantId,
+      });
+    }
+
+    if (patch.owner_id !== undefined) {
+      await setOwner(ticketId, patch.owner_id, actor, {
+        tenantId: tenant.tenantId,
+      });
+    }
+
+    if (patch.title !== undefined) {
+      // There is no ticket_events kind for title changes, so this is a direct
+      // tenant-scoped update. updated_at is maintained by the DB trigger.
+      const { error } = await supabase
+        .from('tickets')
+        .update({ title: patch.title })
+        .eq('id', ticketId)
+        .eq('tenant_id', tenant.tenantId);
+
+      if (error) throw error;
+    }
+  } catch (err) {
+    if (err instanceof InvalidTransitionError) {
+      return NextResponse.json(
+        { error: err.message, from: err.from, to: err.to },
+        { status: 409 }
+      );
+    }
+    if (err instanceof TicketNotFoundError) {
+      return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+    }
+    if (err instanceof ConcurrentUpdateError) {
+      return NextResponse.json(
+        { error: 'Ticket was modified concurrently' },
+        { status: 409 }
+      );
+    }
+    throw err;
+  }
+
+  const { data: ticket, error: reloadError } = await supabase
+    .from('tickets')
     .select('*')
+    .eq('id', ticketId)
+    .eq('tenant_id', tenant.tenantId)
     .single();
 
-  if (error || !ticket) {
-    return NextResponse.json({ error: 'Update failed' }, { status: 500 });
+  if (reloadError || !ticket) {
+    return NextResponse.json({ error: 'Failed to reload ticket' }, { status: 500 });
   }
 
   return NextResponse.json({ ticket });
