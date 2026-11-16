@@ -4,14 +4,14 @@ import { getTenantByDomain } from '@/lib/tenant';
 import {
   findOrCreateConversation,
   createInboundMessage,
-  getOpenTicketByConversationId,
   createTicket,
-  updateTicket,
   createMessage,
   hasInboundMessage,
 } from '@/lib/db';
 import { enqueueJob, kickJobRunner, getJobByDedupeKey } from '@/lib/jobs';
 import { JOB_TYPE_INBOUND_EMAIL_PROCESS } from '@/lib/job-handlers';
+import { routeInbound } from '@/lib/tickets/routing';
+import { recordEvent } from '@/lib/tickets/service';
 import { getReceivedEmail } from '@/lib/resend';
 import { checkWebhookLimit } from '@/lib/rate-limit';
 
@@ -35,6 +35,15 @@ function normalizeTo(dataTo: unknown): string {
     return typeof dataTo[0] === 'string' ? dataTo[0] : '';
   }
   return '';
+}
+
+/** Use the provider timestamp when valid, otherwise the wall clock. */
+function parseReceivedAt(value: unknown): Date {
+  if (typeof value === 'string') {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return new Date();
 }
 
 // ── POST /api/webhook/resend ───────────────────────────────────────────────────
@@ -187,22 +196,34 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // 8. Reuse the conversation's open ticket as a follow-up, else create one
-    const existingTicket = await getOpenTicketByConversationId(conversation.id);
-    const isFollowUp = Boolean(existingTicket);
+    // 8. Route the email: drop spam, append to the conversation's canonical
+    //    ticket, or open a fresh ticket in Triage.
+    const route = await routeInbound({
+      tenantId: tenant.id,
+      conversationId: conversation.id,
+      receivedAt: parseReceivedAt(data.created_at),
+    });
+
+    if (route.action === 'drop') {
+      // Never log the email body.
+      console.log('[Resend Webhook] ignored inbound email: spam conversation');
+      return NextResponse.json(
+        { status: 'ignored', reason: 'spam' },
+        { status: 200 }
+      );
+    }
+
+    const isFollowUp = route.action === 'append';
 
     let ticketId: string;
-    if (existingTicket) {
-      ticketId = existingTicket.id;
-      if (existingTicket.status === 'resolved') {
-        await updateTicket(ticketId, { status: 'todo' });
-      }
+    if (route.action === 'append') {
+      ticketId = route.ticketId;
       if (!alreadyIngested) {
         await createMessage({
           ticket_id: ticketId,
           direction: 'incoming',
           content: text,
-          sender_name: existingTicket.contact_name ?? null,
+          sender_name: null,
           tenant_id: tenant.id,
         });
       }
@@ -215,7 +236,7 @@ export async function POST(request: NextRequest) {
         subject,
         title: subject,
         body: text,
-        status: 'todo',
+        status: 'triage',
         auto_resolved: false,
         auto_reply_sent: false,
       });
@@ -226,6 +247,13 @@ export async function POST(request: NextRequest) {
         );
       }
       ticketId = ticket.id;
+      await recordEvent({
+        tenantId: tenant.id,
+        ticketId,
+        kind: 'created',
+        actor: { type: 'system' },
+        to: 'triage',
+      });
       if (!alreadyIngested) {
         await createMessage({
           ticket_id: ticketId,
@@ -254,6 +282,10 @@ export async function POST(request: NextRequest) {
           subject,
           body: text,
           isFollowUp,
+          routing: {
+            action: route.action,
+            effects: route.action === 'append' ? route.effects : undefined,
+          },
         },
         dedupeKey: dedupeKey || null,
       });

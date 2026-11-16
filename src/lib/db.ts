@@ -352,24 +352,6 @@ export async function updateTicket(id: string, updates: Partial<TicketInsert>) {
 }
 
 /**
- * Get the most recent non-closed ticket for a conversation (used to thread
- * follow-ups). Closed = resolved, canceled or duplicate.
- */
-export async function getOpenTicketByConversationId(conversationId: string) {
-  const { data, error } = await supabase
-    .from('tickets')
-    .select('*')
-    .eq('conversation_id', conversationId)
-    .not('status', 'in', '(resolved,canceled,duplicate)')
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) return null;
-  return data;
-}
-
-/**
  * Get all messages for a ticket, ordered chronologically.
  */
 export async function getMessagesByTicketId(ticketId: string) {
