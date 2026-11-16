@@ -1,5 +1,5 @@
 // GET  /api/tickets/[id]  — fetch ticket + messages + outbound messages
-// PATCH /api/tickets/[id] — update ticket status or assign (agent actions)
+// PATCH /api/tickets/[id] — update ticket status or owner (agent actions)
 
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
@@ -96,14 +96,23 @@ export async function PATCH(
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  // Only allow safe status updates from the agent interface
-  const allowedFields = ['status', 'assigned_to'];
+  // Only allow safe status/owner updates from the agent interface
+  const allowedFields = ['status', 'owner_id'];
   const updates: Record<string, unknown> = {};
   for (const field of allowedFields) {
     if (field in body) updates[field] = body[field];
   }
 
-  const validStatuses = ['open', 'resolved', 'pending'];
+  const validStatuses = [
+    'triage',
+    'todo',
+    'in_progress',
+    'waiting_on_customer',
+    'waiting_on_approval',
+    'resolved',
+    'canceled',
+    'duplicate',
+  ];
   if (updates.status && !validStatuses.includes(updates.status as string)) {
     return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
   }

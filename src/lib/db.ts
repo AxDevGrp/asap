@@ -230,6 +230,36 @@ export async function hasInboundMessage(messageId: string): Promise<boolean> {
 
 // ── Tickets ─────────────────────────────────────────────────────────────────────
 
+export type TicketStatus =
+  | 'triage'
+  | 'todo'
+  | 'in_progress'
+  | 'waiting_on_customer'
+  | 'waiting_on_approval'
+  | 'resolved'
+  | 'canceled'
+  | 'duplicate';
+
+export type TicketPriority = 'none' | 'low' | 'medium' | 'high' | 'urgent';
+
+/** Map AI triage urgency onto the ticket priority scale. */
+export function urgencyToPriority(
+  urgency: string | null | undefined
+): TicketPriority {
+  switch (urgency) {
+    case 'critical':
+      return 'urgent';
+    case 'high':
+      return 'high';
+    case 'medium':
+      return 'medium';
+    case 'low':
+      return 'low';
+    default:
+      return 'none';
+  }
+}
+
 export interface TicketInsert {
   product?: string | null;
   tenant_id?: string | null;
@@ -237,6 +267,7 @@ export interface TicketInsert {
   contact_name?: string | null;
   contact_email?: string | null;
   subject?: string | null;
+  title?: string | null;
   body?: string | null;
   triage_type?: string | null;
   triage_urgency?: 'low' | 'medium' | 'high' | 'critical' | null;
@@ -246,7 +277,25 @@ export interface TicketInsert {
   auto_reply_text?: string | null;
   auto_resolved?: boolean;
   resolve_reason?: string | null;
-  status?: 'open' | 'resolved' | 'pending';
+  status?: TicketStatus;
+  priority?: TicketPriority;
+  number?: number | null;
+  owner_id?: string | null;
+  agent_delegated?: boolean;
+  duplicate_of?: string | null;
+  snoozed_until?: string | null;
+  snooze_until_reply?: boolean;
+  decline_kind?: 'spam' | 'not_actionable' | null;
+  accepted_at?: string | null;
+  first_response_at?: string | null;
+  resolved_at?: string | null;
+  closed_at?: string | null;
+}
+
+export interface TicketRow extends TicketInsert {
+  id: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ResolveAuditInsert {
@@ -303,14 +352,15 @@ export async function updateTicket(id: string, updates: Partial<TicketInsert>) {
 }
 
 /**
- * Get the most recent open ticket for a conversation (used to thread follow-ups).
+ * Get the most recent non-closed ticket for a conversation (used to thread
+ * follow-ups). Closed = resolved, canceled or duplicate.
  */
 export async function getOpenTicketByConversationId(conversationId: string) {
   const { data, error } = await supabase
     .from('tickets')
     .select('*')
     .eq('conversation_id', conversationId)
-    .neq('status', 'resolved')
+    .not('status', 'in', '(resolved,canceled,duplicate)')
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();

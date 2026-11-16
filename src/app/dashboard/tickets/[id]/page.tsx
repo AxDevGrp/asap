@@ -18,7 +18,18 @@ interface Ticket {
   auto_reply_sent: boolean;
   auto_reply_text: string | null;
   auto_resolved: boolean;
-  status: 'open' | 'resolved' | 'pending';
+  status:
+    | 'triage'
+    | 'todo'
+    | 'in_progress'
+    | 'waiting_on_customer'
+    | 'waiting_on_approval'
+    | 'resolved'
+    | 'canceled'
+    | 'duplicate';
+  title: string | null;
+  number: number | null;
+  priority: 'none' | 'low' | 'medium' | 'high' | 'urgent';
   created_at: string;
   updated_at: string;
 }
@@ -51,10 +62,17 @@ const urgencyColors: Record<string, string> = {
 };
 
 const statusColors: Record<string, string> = {
-  open: 'text-amber-700 bg-amber-50',
+  triage: 'text-purple-700 bg-purple-50',
+  todo: 'text-amber-700 bg-amber-50',
+  in_progress: 'text-blue-700 bg-blue-50',
+  waiting_on_customer: 'text-sky-700 bg-sky-50',
+  waiting_on_approval: 'text-indigo-700 bg-indigo-50',
   resolved: 'text-green-700 bg-green-50',
-  pending: 'text-blue-700 bg-blue-50',
+  canceled: 'text-gray-600 bg-gray-100',
+  duplicate: 'text-gray-600 bg-gray-100',
 };
+
+const closedStatuses = ['resolved', 'canceled', 'duplicate'];
 
 const outboundStatusColors: Record<string, string> = {
   sent: 'text-green-600 bg-green-50',
@@ -170,7 +188,7 @@ export default function TicketDetailPage() {
 
   // ── Update status ────────────────────────────────────────────────────────────
 
-  async function handleStatusChange(newStatus: 'open' | 'resolved' | 'pending') {
+  async function handleStatusChange(newStatus: Ticket['status']) {
     if (!ticket) return;
     setUpdatingStatus(true);
 
@@ -236,9 +254,16 @@ export default function TicketDetailPage() {
           >
             ← All Tickets
           </Link>
-          <h1 className="text-xl font-bold text-gray-900">{contactDisplay}</h1>
+          <h1 className="text-xl font-bold text-gray-900">
+            {ticket.number != null && (
+              <span className="text-gray-400 font-mono mr-2">#{ticket.number}</span>
+            )}
+            {ticket.title ?? contactDisplay}
+          </h1>
           {ticket.contact_email && (
-            <p className="text-sm text-gray-400 mt-0.5">{ticket.contact_email}</p>
+            <p className="text-sm text-gray-400 mt-0.5">
+              {contactDisplay} · {ticket.contact_email}
+            </p>
           )}
         </div>
 
@@ -250,7 +275,7 @@ export default function TicketDetailPage() {
             {ticket.status}
           </span>
 
-          {ticket.status !== 'resolved' ? (
+          {!closedStatuses.includes(ticket.status) ? (
             <button
               onClick={() => handleStatusChange('resolved')}
               disabled={updatingStatus}
@@ -260,7 +285,7 @@ export default function TicketDetailPage() {
             </button>
           ) : (
             <button
-              onClick={() => handleStatusChange('open')}
+              onClick={() => handleStatusChange('todo')}
               disabled={updatingStatus}
               className="text-xs font-medium px-3 py-1 bg-gray-200 text-gray-700 rounded-md hover:bg-gray-300 disabled:opacity-50 transition-colors"
             >
@@ -546,7 +571,7 @@ export default function TicketDetailPage() {
             <div className="mt-4 pt-4 border-t border-gray-100">
               <p className="text-xs text-gray-400 font-medium mb-2">Change Status</p>
               <div className="flex gap-2 flex-wrap">
-                {(['open', 'pending', 'resolved'] as const).map((s) => (
+                {(['todo', 'in_progress', 'waiting_on_customer', 'resolved'] as const).map((s) => (
                   <button
                     key={s}
                     onClick={() => handleStatusChange(s)}

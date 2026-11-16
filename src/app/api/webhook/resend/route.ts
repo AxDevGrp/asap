@@ -195,7 +195,7 @@ export async function POST(request: NextRequest) {
     if (existingTicket) {
       ticketId = existingTicket.id;
       if (existingTicket.status === 'resolved') {
-        await updateTicket(ticketId, { status: 'open' });
+        await updateTicket(ticketId, { status: 'todo' });
       }
       if (!alreadyIngested) {
         await createMessage({
@@ -213,8 +213,9 @@ export async function POST(request: NextRequest) {
         contact_name: null,
         contact_email: contactEmail,
         subject,
+        title: subject,
         body: text,
-        status: 'open',
+        status: 'todo',
         auto_resolved: false,
         auto_reply_sent: false,
       });

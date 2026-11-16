@@ -15,6 +15,17 @@ function StatCard({ label, value, sub }: { label: string; value: string | number
   );
 }
 
+const statusColors: Record<string, string> = {
+  triage: 'text-purple-700 bg-purple-50',
+  todo: 'text-amber-700 bg-amber-50',
+  in_progress: 'text-blue-700 bg-blue-50',
+  waiting_on_customer: 'text-sky-700 bg-sky-50',
+  waiting_on_approval: 'text-indigo-700 bg-indigo-50',
+  resolved: 'text-green-700 bg-green-50',
+  canceled: 'text-gray-600 bg-gray-100',
+  duplicate: 'text-gray-600 bg-gray-100',
+};
+
 const urgencyColors: Record<string, string> = {
   critical: 'text-red-700 bg-red-50',
   high: 'text-orange-700 bg-orange-50',
@@ -124,9 +135,7 @@ export default async function DashboardPage() {
                   )}
                   <span
                     className={`text-xs font-medium px-2 py-0.5 rounded-full ${
-                      ticket.status === 'open'
-                        ? 'text-amber-700 bg-amber-50'
-                        : 'text-green-700 bg-green-50'
+                      statusColors[ticket.status] ?? 'text-gray-600 bg-gray-100'
                     }`}
                   >
                     {ticket.status}

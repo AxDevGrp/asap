@@ -56,7 +56,10 @@ export async function getTenantAnalytics(tenantId: string): Promise<TenantAnalyt
 
   const tickets = ticketResult.data ?? [];
   const totalTickets = tickets.length;
-  const openTickets = tickets.filter((t) => t.status === 'open').length;
+  // "Open" = anything not closed (triage + active statuses).
+  const openTickets = tickets.filter(
+    (t) => !['resolved', 'canceled', 'duplicate'].includes(t.status)
+  ).length;
   const resolvedTickets = tickets.filter((t) => t.status === 'resolved').length;
   const autoResolvedTickets = tickets.filter((t) => t.auto_resolved).length;
   const autoResolveRate = totalTickets > 0

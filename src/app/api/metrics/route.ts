@@ -54,7 +54,11 @@ export async function GET(_req: NextRequest) {
       db.from('tickets').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId),
       db.from('tickets').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).gte('created_at', last24h),
       db.from('tickets').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).gte('created_at', last7d),
-      db.from('tickets').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('status', 'open'),
+      db
+        .from('tickets')
+        .select('id', { count: 'exact', head: true })
+        .eq('tenant_id', tenantId)
+        .in('status', ['triage', 'todo', 'in_progress', 'waiting_on_customer', 'waiting_on_approval']),
       db.from('tickets').select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('auto_resolved', true),
     ]);
 

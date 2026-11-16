@@ -39,4 +39,15 @@ for file in "${files[@]}"; do
   fi
 done
 
+scripts=(scripts/sql-tests/*.sh)
+for script in "${scripts[@]}"; do
+  [[ -x "$script" ]] || continue
+  if TEST_DB_URL="$TEST_DB_URL" "$script"; then
+    echo "PASS $script"
+  else
+    echo "FAIL $script" >&2
+    failed=1
+  fi
+done
+
 exit "$failed"
