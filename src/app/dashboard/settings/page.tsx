@@ -15,6 +15,13 @@ interface TenantSettings {
   };
 }
 
+interface TicketLabel {
+  id: string;
+  name: string;
+  color: string;
+  description: string | null;
+}
+
 interface TenantPolicy {
   autoSendEnabled: boolean;
   confidenceThreshold: number;
@@ -48,6 +55,15 @@ const AI_TONE_OPTIONS = [
   { value: 'empathetic', label: 'Empathetic', desc: 'Compassionate, understanding' },
 ];
 
+async function responseError(res: Response): Promise<string> {
+  try {
+    const data = await res.json();
+    return data.error ?? 'Request failed';
+  } catch {
+    return 'Request failed';
+  }
+}
+
 export default function SettingsPage() {
   const [tenant, setTenant] = useState<TenantSettings | null>(null);
   const [loading, setLoading] = useState(true);
@@ -67,6 +83,17 @@ export default function SettingsPage() {
   const [policySaving, setPolicySaving] = useState(false);
   const [policySuccess, setPolicySuccess] = useState(false);
   const [policyError, setPolicyError] = useState<string | null>(null);
+
+  // Labels (managed via /api/tenants/[id]/labels)
+  const [labels, setLabels] = useState<TicketLabel[]>([]);
+  const [labelDrafts, setLabelDrafts] = useState<
+    Record<string, { name: string; color: string }>
+  >({});
+  const [newLabelName, setNewLabelName] = useState('');
+  const [newLabelColor, setNewLabelColor] = useState('#6b7280');
+  const [labelsSaving, setLabelsSaving] = useState(false);
+  const [labelsError, setLabelsError] = useState<string | null>(null);
+  const [labelsSuccess, setLabelsSuccess] = useState<string | null>(null);
 
   const fetchTenant = useCallback(async () => {
     setLoading(true);
@@ -90,6 +117,17 @@ export default function SettingsPage() {
       const policyRes = await fetch(`/api/tenants/${tenantId}/policy`);
       if (policyRes.ok) {
         setPolicy(await policyRes.json());
+      }
+
+      const labelsRes = await fetch(`/api/tenants/${tenantId}/labels`);
+      if (labelsRes.ok) {
+        const loaded: TicketLabel[] = await labelsRes.json();
+        setLabels(loaded);
+        setLabelDrafts(
+          Object.fromEntries(
+            loaded.map((label) => [label.id, { name: label.name, color: label.color }])
+          )
+        );
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load settings');
@@ -134,6 +172,97 @@ export default function SettingsPage() {
       setPolicyError(err instanceof Error ? err.message : 'Save failed');
     } finally {
       setPolicySaving(false);
+    }
+  }
+
+  async function handleCreateLabel() {
+    if (!tenant || !newLabelName.trim()) return;
+
+    setLabelsSaving(true);
+    setLabelsError(null);
+    setLabelsSuccess(null);
+
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/labels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newLabelName.trim(), color: newLabelColor }),
+      });
+      if (!res.ok) throw new Error(await responseError(res));
+
+      const created: TicketLabel = await res.json();
+      setLabels((prev) =>
+        [...prev, created].sort((a, b) => a.name.localeCompare(b.name))
+      );
+      setLabelDrafts((prev) => ({
+        ...prev,
+        [created.id]: { name: created.name, color: created.color },
+      }));
+      setNewLabelName('');
+      setLabelsSuccess('Label added.');
+    } catch (err) {
+      setLabelsError(err instanceof Error ? err.message : 'Could not add label');
+    } finally {
+      setLabelsSaving(false);
+    }
+  }
+
+  async function handleSaveLabel(id: string) {
+    if (!tenant) return;
+    const draft = labelDrafts[id];
+    if (!draft) return;
+
+    setLabelsSaving(true);
+    setLabelsError(null);
+    setLabelsSuccess(null);
+
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/labels/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: draft.name.trim(), color: draft.color }),
+      });
+      if (!res.ok) throw new Error(await responseError(res));
+
+      const updated: TicketLabel = await res.json();
+      setLabels((prev) => prev.map((label) => (label.id === id ? updated : label)));
+      setLabelDrafts((prev) => ({
+        ...prev,
+        [id]: { name: updated.name, color: updated.color },
+      }));
+      setLabelsSuccess('Label saved.');
+    } catch (err) {
+      setLabelsError(err instanceof Error ? err.message : 'Could not save label');
+    } finally {
+      setLabelsSaving(false);
+    }
+  }
+
+  async function handleDeleteLabel(id: string) {
+    if (!tenant) return;
+    if (!window.confirm('Delete this label? It will be removed from all tickets.')) return;
+
+    setLabelsSaving(true);
+    setLabelsError(null);
+    setLabelsSuccess(null);
+
+    try {
+      const res = await fetch(`/api/tenants/${tenant.id}/labels/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) throw new Error(await responseError(res));
+
+      setLabels((prev) => prev.filter((label) => label.id !== id));
+      setLabelDrafts((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setLabelsSuccess('Label deleted.');
+    } catch (err) {
+      setLabelsError(err instanceof Error ? err.message : 'Could not delete label');
+    } finally {
+      setLabelsSaving(false);
     }
   }
 
@@ -442,6 +571,101 @@ export default function SettingsPage() {
                 {policyError && <span className="text-sm text-red-700">{policyError}</span>}
               </div>
             </div>
+          )}
+        </section>
+
+        {/* Labels */}
+        <section className="bg-white rounded-lg border border-gray-200 p-6">
+          <h2 className="text-base font-semibold text-gray-900 mb-1">Labels</h2>
+          <p className="text-xs text-gray-400 mb-4">
+            Tags your team can add to tickets. Only owners and admins can manage labels.
+          </p>
+
+          <div className="space-y-2 mb-4">
+            {labels.length === 0 && (
+              <div className="text-gray-400 text-sm">No labels yet.</div>
+            )}
+            {labels.map((label) => {
+              const draft = labelDrafts[label.id] ?? {
+                name: label.name,
+                color: label.color,
+              };
+              return (
+                <div key={label.id} className="flex items-center gap-2">
+                  <input
+                    type="color"
+                    value={draft.color}
+                    onChange={(e) =>
+                      setLabelDrafts((prev) => ({
+                        ...prev,
+                        [label.id]: { ...draft, color: e.target.value },
+                      }))
+                    }
+                    title="Label colour"
+                    className="w-8 h-8 rounded border border-gray-300 cursor-pointer shrink-0"
+                  />
+                  <input
+                    type="text"
+                    value={draft.name}
+                    maxLength={50}
+                    onChange={(e) =>
+                      setLabelDrafts((prev) => ({
+                        ...prev,
+                        [label.id]: { ...draft, name: e.target.value },
+                      }))
+                    }
+                    className="flex-1 min-w-0 border border-gray-300 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleSaveLabel(label.id)}
+                    disabled={labelsSaving}
+                    className="text-sm font-medium text-gray-900 px-2 py-1.5 hover:underline disabled:opacity-50"
+                  >
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteLabel(label.id)}
+                    disabled={labelsSaving}
+                    className="text-sm text-red-600 px-2 py-1.5 hover:underline disabled:opacity-50"
+                  >
+                    Delete
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={newLabelColor}
+              onChange={(e) => setNewLabelColor(e.target.value)}
+              title="New label colour"
+              className="w-8 h-8 rounded border border-gray-300 cursor-pointer shrink-0"
+            />
+            <input
+              type="text"
+              value={newLabelName}
+              placeholder="New label name"
+              maxLength={50}
+              onChange={(e) => setNewLabelName(e.target.value)}
+              className="flex-1 min-w-0 border border-gray-300 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900"
+            />
+            <button
+              type="button"
+              onClick={handleCreateLabel}
+              disabled={labelsSaving || !newLabelName.trim()}
+              className="bg-gray-900 text-white text-sm font-medium px-3 py-1.5 rounded-md hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              Add label
+            </button>
+          </div>
+
+          {labelsError && <p className="text-sm text-red-700 mt-2">{labelsError}</p>}
+          {labelsSuccess && (
+            <p className="text-sm text-green-700 mt-2">{labelsSuccess}</p>
           )}
         </section>
 
