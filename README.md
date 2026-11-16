@@ -11,6 +11,10 @@ An AI-first customer support platform. Incoming emails arrive via Resend, are tr
 5. The draft is stored on the ticket (`auto_reply_text`) and pre-filled in the dashboard for human review
 6. Auto-send via Resend is **off by default** — it only fires when a tenant opts in with `settings.autoSendEnabled === true` and the auto-resolve policy agrees. Follow-ups never auto-send.
 
+## Ticketing & Agents
+
+Conventions, glossary, ticket status model and workflow for the ticketing project: [docs/ticketing/README.md](docs/ticketing/README.md).
+
 ## Tech Stack
 
 - **Framework**: Next.js 14 (App Router)
