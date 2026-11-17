@@ -273,6 +273,11 @@ export interface TicketInsert {
   triage_urgency?: 'low' | 'medium' | 'high' | 'critical' | null;
   triage_summary?: string | null;
   triage_confidence?: number | null;
+  ai_suggested_priority?: 'low' | 'medium' | 'high' | 'urgent' | null;
+  ai_suggested_type?: string | null;
+  ai_suggested_label_ids?: string[] | null;
+  ai_spam_probability?: number | null;
+  ai_needs_human_probability?: number | null;
   auto_reply_sent?: boolean;
   auto_reply_text?: string | null;
   auto_resolved?: boolean;

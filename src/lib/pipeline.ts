@@ -26,6 +26,13 @@ import type { Tenant } from '@/lib/tenant';
 import { searchKB, generateRagReply, generateFollowUpReply, KBArticle } from '@/lib/rag';
 import { shouldAutoResolve } from '@/lib/auto-resolve';
 import { getTenantPolicy } from '@/lib/policies';
+import { listLabels } from '@/lib/tickets/labels';
+import {
+  decideTriage,
+  priorityToUrgency,
+  type TriageDecision,
+  type TriageLabel,
+} from '@/lib/triage/decide';
 import { sendEmail } from '@/lib/resend';
 import { TriageResult } from '@/types/triage';
 
@@ -125,6 +132,26 @@ export async function afterTriage(_ticketId: string): Promise<void> {
   // intentionally empty
 }
 
+/**
+ * Store decision suggestions on the ticket. They are recorded only — never
+ * applied (no label added, no decline, no status change).
+ */
+function suggestionColumns(decision: TriageDecision): {
+  ai_suggested_priority: TriageDecision['priority'];
+  ai_suggested_type: string;
+  ai_suggested_label_ids: string[];
+  ai_spam_probability: number;
+  ai_needs_human_probability: number;
+} {
+  return {
+    ai_suggested_priority: decision.priority,
+    ai_suggested_type: decision.type,
+    ai_suggested_label_ids: decision.suggestedLabelIds,
+    ai_spam_probability: decision.spamProbability,
+    ai_needs_human_probability: decision.needsHumanProbability,
+  };
+}
+
 export async function processInboundEmail(
   input: ProcessInboundEmailInput
 ): Promise<ProcessInboundEmailResult> {
@@ -138,6 +165,10 @@ export async function processInboundEmail(
 
   // 1. Triage (new tickets only — follow-ups reuse existing triage)
   let triage: Partial<TriageResult> | null = null;
+  // In jev mode the decision supplies type/priority/urgency/confidence. This is
+  // the effective triage used by the auto-resolve decision and audits.
+  let decisionTriage: Partial<TriageResult> | null = null;
+
   if (!isFollowUp) {
     try {
       triage = await triageTicket(body, subject, tenantName, {
@@ -146,15 +177,96 @@ export async function processInboundEmail(
         tone: (tenant.settings?.ai_tone ?? tenant.settings?.tone) as string | undefined,
         brandContext: tenant.settings?.brandContext as string | undefined,
       });
-      await updateTicket(ticketId, {
-        triage_type: triage.type,
-        triage_urgency: triage.urgency,
-        triage_summary: triage.summary,
-        triage_confidence: triage.confidence,
-        priority: urgencyToPriority(triage.urgency),
-      });
     } catch (err) {
       console.error('[Pipeline] Triage failed:', err);
+    }
+
+    const gemmaFields = triage
+      ? {
+          triage_type: triage.type,
+          triage_urgency: triage.urgency,
+          triage_summary: triage.summary,
+          triage_confidence: triage.confidence,
+          priority: urgencyToPriority(triage.urgency),
+        }
+      : {};
+
+    if (policy.decisionMode === 'llm') {
+      if (triage) await updateTicket(ticketId, gemmaFields);
+    } else {
+      let tenantLabels: TriageLabel[] = [];
+      try {
+        tenantLabels = await listLabels(tenant.id);
+      } catch (err) {
+        console.error('[Pipeline] Failed to load tenant labels:', err);
+      }
+
+      const ticketInput = { subject, body, contactEmail };
+      const decideOpts = {
+        tenantId: tenant.id,
+        ticketId,
+        labelThreshold: policy.decisionThresholds.label_suggest,
+      };
+
+      if (policy.decisionMode === 'shadow') {
+        // Gemma remains the source of the triage fields; both decisions run in
+        // parallel so decision_log gets one JEV row and one LLM row.
+        const [jev, llm] = await Promise.allSettled([
+          decideTriage(ticketInput, tenantLabels, undefined, { ...decideOpts, engine: 'jev' }),
+          decideTriage(ticketInput, tenantLabels, undefined, { ...decideOpts, engine: 'llm' }),
+        ]);
+        if (jev.status === 'rejected') {
+          console.error('[Pipeline] Shadow jev decision failed:', jev.reason);
+        }
+        if (llm.status === 'rejected') {
+          console.error('[Pipeline] Shadow llm decision failed:', llm.reason);
+        }
+
+        const suggestion =
+          jev.status === 'fulfilled'
+            ? jev.value
+            : llm.status === 'fulfilled'
+              ? llm.value
+              : null;
+
+        if (triage || suggestion) {
+          await updateTicket(ticketId, {
+            ...gemmaFields,
+            ...(suggestion ? suggestionColumns(suggestion) : {}),
+          });
+        }
+      } else {
+        let decision: TriageDecision | null = null;
+        try {
+          decision = await decideTriage(ticketInput, tenantLabels, undefined, {
+            ...decideOpts,
+            engine: 'jev',
+          });
+        } catch (err) {
+          console.error('[Pipeline] JEV triage decision failed, falling back to Gemma:', err);
+        }
+
+        if (decision) {
+          const urgency = priorityToUrgency(decision.priority);
+          const confidence = decision.confidence ?? triage?.confidence;
+          decisionTriage = {
+            ...(triage ?? {}),
+            type: decision.type,
+            urgency,
+            confidence,
+          };
+          await updateTicket(ticketId, {
+            triage_type: decision.type,
+            triage_urgency: urgency,
+            priority: decision.priority,
+            triage_summary: triage?.summary,
+            triage_confidence: confidence,
+            ...suggestionColumns(decision),
+          });
+        } else if (triage) {
+          await updateTicket(ticketId, gemmaFields);
+        }
+      }
     }
   }
 
@@ -186,11 +298,18 @@ export async function processInboundEmail(
   const kbHits = kbArticles.length;
   const topKbSimilarity = kbHits > 0 ? kbArticles[0].similarity : null;
 
+  // JEV mode's decision drives the auto-resolve check; other modes use Gemma.
+  const effectiveTriage = decisionTriage ?? triage;
+
   // 3. Auto-resolve decision. Follow-ups NEVER auto-send. autoSendEnabled is
   // enforced inside shouldAutoResolve (the policy is the single switch).
   const { autoSend: policyAutoSend, reason } = shouldAutoResolve(
     policy,
-    { confidence: triage?.confidence, type: triage?.type, urgency: triage?.urgency },
+    {
+      confidence: effectiveTriage?.confidence,
+      type: effectiveTriage?.type,
+      urgency: effectiveTriage?.urgency,
+    },
     kbHits,
     topKbSimilarity
   );
@@ -224,9 +343,9 @@ export async function processInboundEmail(
             tenant_id: tenant.id,
             auto_send: false,
             reason: 'auto-send previously failed; kept as draft',
-            triage_confidence: triage?.confidence ?? null,
-            triage_type: triage?.type ?? null,
-            triage_urgency: triage?.urgency ?? null,
+            triage_confidence: effectiveTriage?.confidence ?? null,
+            triage_type: effectiveTriage?.type ?? null,
+            triage_urgency: effectiveTriage?.urgency ?? null,
             kb_hits: kbHits,
             top_kb_similarity: topKbSimilarity,
             policy_version: policy.version,
@@ -236,7 +355,7 @@ export async function processInboundEmail(
             draft: replyText || null,
             autoSent: false,
             reason: 'auto-send previously failed; kept as draft',
-            triage,
+            triage: effectiveTriage,
             kbHits,
             topKbSimilarity,
           };
@@ -253,7 +372,7 @@ export async function processInboundEmail(
           draft: replyText || null,
           autoSent: true,
           reason,
-          triage,
+          triage: effectiveTriage,
           kbHits,
           topKbSimilarity,
         };
@@ -349,9 +468,9 @@ export async function processInboundEmail(
     tenant_id: tenant.id,
     auto_send: autoSend,
     reason,
-    triage_confidence: triage?.confidence ?? null,
-    triage_type: triage?.type ?? null,
-    triage_urgency: triage?.urgency ?? null,
+    triage_confidence: effectiveTriage?.confidence ?? null,
+    triage_type: effectiveTriage?.type ?? null,
+    triage_urgency: effectiveTriage?.urgency ?? null,
     kb_hits: kbHits,
     top_kb_similarity: topKbSimilarity,
     policy_version: policy.version,
@@ -363,7 +482,7 @@ export async function processInboundEmail(
     draft: replyText || null,
     autoSent: autoSend,
     reason,
-    triage,
+    triage: effectiveTriage,
     kbHits,
     topKbSimilarity,
   };
