@@ -72,8 +72,8 @@ begin
     raise exception 'priority_rank accepted a direct write';
   end if;
 
-  -- Priority ordering is urgent..none (ties broken by id desc).
-  select string_agg(subject, ',' order by priority_rank desc, id desc)
+  -- Priority ordering is urgent..none (rank-4 ties broken deterministically).
+  select string_agg(subject, ',' order by priority_rank desc, subject desc)
   into ordered
   from public.tickets
   where tenant_id = ta;
