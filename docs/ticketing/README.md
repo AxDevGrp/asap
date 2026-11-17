@@ -41,6 +41,78 @@ Priority: `none | low | medium | high | urgent`. Ticket IDs: `<PREFIX>-<n>` per 
 * **Inbound email:** `src/app/api/webhook/resend/route.ts` (Svix-verified, `email.received`) → enqueues `inbound_email.process` → `processInboundEmail` in `src/lib/pipeline.ts`.
 * **Policies:** `tenant_policies` via `getTenantPolicy()` (`src/lib/policies.ts`). **Auto-send is off by default** and must stay opt-in.
 
+## Switching a tenant to JEV
+
+Triage decisions have three modes in `tenant_policies.decision_mode`:
+
+* `llm` — the legacy Gemma triage fills the ticket fields; no typed decisions are logged.
+* `shadow` (default) — Gemma still fills the ticket, and `decideTriage()` runs **both** engines in parallel, writing one JEV row and one LLM row per ticket to `decision_log`. Nothing from the typed decisions is applied; only the stored `ai_suggested_*` suggestions change.
+* `jev` — JEV drives type, priority, spam/needs-human probabilities and label suggestions, falling back to Gemma if the JEV call fails.
+
+Never flip a tenant to `jev` on faith. Leave it in `shadow` until enough tickets have human outcomes, then let the report decide.
+
+### 1. Collect ground truth in shadow mode
+
+A ticket counts as ground truth only once a human has acted on it: its status left `triage`, or it was declined. The report reads the ticket's current priority, its labels, and whether it was accepted / declined as spam / declined as not_actionable. Labels are compared per `label_<i>` question using the label name inside the question instructions (`Does the label "<name>" apply?`). There is no human-set type yet, so type is reported as JEV-vs-LLM agreement; needs_human has no ground truth and is reported as mean probability and count above the threshold.
+
+### 2. Run the report
+
+The script is strictly read-only (selects only) and paginates 1000 rows per page. `--tenant` accepts a slug or a UUID.
+
+Local (`supabase start && supabase db reset` first):
+
+```sh
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321 \
+SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o json | jq -r .SERVICE_ROLE_KEY)" \
+node scripts/decision-report.mjs --tenant goasap --from 2026-01-01 --to 2026-01-31
+```
+
+Hosted (only once the `decision_log` migration is merged and pushed):
+
+```sh
+node --env-file=.env.local scripts/decision-report.mjs --tenant <slug|uuid> [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--json]
+```
+
+`--json` prints the machine-readable report instead of the text summary. For local UI-free checks, `scripts/fixtures/decision-report-fixture.sql` inserts 60 fixture tickets with both engines' decisions and human outcomes; load it with `psql "$DB_URL" -v ON_ERROR_STOP=1 -f scripts/fixtures/decision-report-fixture.sql`, run the report, then `supabase db reset` to remove it.
+
+### 3. Read the go/no-go
+
+The report prints counts, per-engine priority accuracy with a 4×4 confusion matrix (rows truth, columns predicted), spam precision/recall/F1 at thresholds 0.50–0.95, pooled label precision/recall/F1 at the same thresholds, type agreement and confusion, needs-human means, and latency/cost.
+
+**GO** requires all three:
+
+1. at least 50 tickets with ground truth;
+2. JEV priority accuracy ≥ LLM priority accuracy;
+3. JEV spam F1 at the recommended threshold ≥ LLM spam F1 at that same threshold.
+
+Otherwise it prints **NO-GO** with every failing reason. The recommended `decision_thresholds` are:
+
+* `spam_auto_decline` — the smallest threshold with JEV spam precision ≥ 0.98, or the 0.95 default with fewer than 10 positive spam examples (or when no threshold reaches 0.98).
+* `label_suggest` — the threshold with the best JEV label F1, or the 0.7 default with fewer than 20 label examples.
+* `needs_human` — unchanged at 0.5 because there is no ground truth yet.
+
+### 4. Apply the thresholds and switch the mode
+
+The policy API does not expose these fields yet, so update the row directly (service role / SQL editor). Use the values the report printed:
+
+```sql
+update tenant_policies
+set decision_mode = 'jev',
+    decision_thresholds = '{"spam_auto_decline":0.95,"label_suggest":0.7,"needs_human":0.5}'::jsonb
+where tenant_id = (select id from tenants where slug = 'goasap');
+```
+
+The update trigger bumps `version`/`updated_at`. `getTenantPolicy()` caches for 60 seconds, so allow a minute before expecting the new mode in the pipeline. Run the report again on fresh data afterwards; a small sample can change the recommendation.
+
+### 5. Roll back
+
+```sql
+update tenant_policies set decision_mode = 'shadow' where tenant_id = ...;  -- keep collecting data
+update tenant_policies set decision_mode = 'llm'    where tenant_id = ...;  -- legacy Gemma path
+```
+
+`shadow` is the safe default: it keeps logging both engines without changing ticket behaviour.
+
 ## Database rules
 
 * New migration per issue: `supabase migration new <name>` → `supabase/migrations/<timestamp>_<name>.sql`. Never edit an applied migration. Idempotent DDL (`if not exists`).
