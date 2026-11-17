@@ -3,6 +3,20 @@
 
 import { createSupabaseAdminClient } from '@/lib/supabase-server';
 
+export type DecisionMode = 'llm' | 'shadow' | 'jev';
+
+export interface DecisionThresholds {
+  spam_auto_decline: number;
+  label_suggest: number;
+  needs_human: number;
+}
+
+export const DEFAULT_DECISION_THRESHOLDS: DecisionThresholds = {
+  spam_auto_decline: 0.95,
+  label_suggest: 0.7,
+  needs_human: 0.5,
+};
+
 export interface TenantPolicy {
   autoSendEnabled: boolean;
   confidenceThreshold: number;
@@ -11,6 +25,8 @@ export interface TenantPolicy {
   minKbSimilarity: number;
   minKbHits: number;
   resolveOnAutoSend: boolean;
+  decisionMode: DecisionMode;
+  decisionThresholds: DecisionThresholds;
   version: number;
 }
 
@@ -23,6 +39,8 @@ export const SAFE_DEFAULT_POLICY: TenantPolicy = {
   minKbSimilarity: 0.7,
   minKbHits: 1,
   resolveOnAutoSend: true,
+  decisionMode: 'shadow',
+  decisionThresholds: DEFAULT_DECISION_THRESHOLDS,
   version: 0,
 };
 
@@ -39,6 +57,8 @@ interface PolicyRow {
   min_kb_similarity: number | string;
   min_kb_hits: number | string;
   resolve_on_auto_send: boolean;
+  decision_mode: string | null;
+  decision_thresholds: unknown;
   version: number | string;
 }
 
@@ -47,7 +67,31 @@ function toNumber(value: number | string | null | undefined, fallback: number): 
   return Number.isFinite(n) ? n : fallback;
 }
 
-function rowToPolicy(row: PolicyRow): TenantPolicy {
+function toDecisionMode(value: unknown): DecisionMode {
+  return value === 'llm' || value === 'jev' || value === 'shadow' ? value : 'shadow';
+}
+
+function toDecisionThresholds(value: unknown): DecisionThresholds {
+  const rec =
+    value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  return {
+    spam_auto_decline: toNumber(
+      rec.spam_auto_decline as number | string | null | undefined,
+      DEFAULT_DECISION_THRESHOLDS.spam_auto_decline
+    ),
+    label_suggest: toNumber(
+      rec.label_suggest as number | string | null | undefined,
+      DEFAULT_DECISION_THRESHOLDS.label_suggest
+    ),
+    needs_human: toNumber(
+      rec.needs_human as number | string | null | undefined,
+      DEFAULT_DECISION_THRESHOLDS.needs_human
+    ),
+  };
+}
+
+/** Map a tenant_policies row to a TenantPolicy, filling partial jsonb with defaults. */
+export function rowToPolicy(row: PolicyRow): TenantPolicy {
   return {
     autoSendEnabled: row.auto_send_enabled === true,
     confidenceThreshold: toNumber(row.confidence_threshold, SAFE_DEFAULT_POLICY.confidenceThreshold),
@@ -56,6 +100,8 @@ function rowToPolicy(row: PolicyRow): TenantPolicy {
     minKbSimilarity: toNumber(row.min_kb_similarity, SAFE_DEFAULT_POLICY.minKbSimilarity),
     minKbHits: toNumber(row.min_kb_hits, SAFE_DEFAULT_POLICY.minKbHits),
     resolveOnAutoSend: row.resolve_on_auto_send === true,
+    decisionMode: toDecisionMode(row.decision_mode),
+    decisionThresholds: toDecisionThresholds(row.decision_thresholds),
     version: toNumber(row.version, SAFE_DEFAULT_POLICY.version),
   };
 }
@@ -73,7 +119,7 @@ export async function getTenantPolicy(tenantId: string): Promise<TenantPolicy> {
     const { data, error } = await supabase
       .from('tenant_policies')
       .select(
-        'tenant_id, auto_send_enabled, confidence_threshold, allowed_types, allowed_urgencies, min_kb_similarity, min_kb_hits, resolve_on_auto_send, version'
+        'tenant_id, auto_send_enabled, confidence_threshold, allowed_types, allowed_urgencies, min_kb_similarity, min_kb_hits, resolve_on_auto_send, decision_mode, decision_thresholds, version'
       )
       .eq('tenant_id', tenantId)
       .maybeSingle();
@@ -124,12 +170,14 @@ export async function updateTenantPolicy(
           min_kb_similarity: merged.minKbSimilarity,
           min_kb_hits: merged.minKbHits,
           resolve_on_auto_send: merged.resolveOnAutoSend,
+          decision_mode: merged.decisionMode,
+          decision_thresholds: merged.decisionThresholds,
           updated_by: userId,
         },
         { onConflict: 'tenant_id' }
       )
       .select(
-        'tenant_id, auto_send_enabled, confidence_threshold, allowed_types, allowed_urgencies, min_kb_similarity, min_kb_hits, resolve_on_auto_send, version'
+        'tenant_id, auto_send_enabled, confidence_threshold, allowed_types, allowed_urgencies, min_kb_similarity, min_kb_hits, resolve_on_auto_send, decision_mode, decision_thresholds, version'
       )
       .single();
 
